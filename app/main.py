@@ -21,9 +21,11 @@ def home():
           body { font-family: Arial, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 18px; line-height: 1.5; }
           code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
           .card { border: 1px solid #ddd; border-radius: 10px; padding: 18px; margin-top: 16px; }
+          .step { border: 2px solid #111; border-radius: 12px; padding: 16px; margin-top: 16px; }
+          .step h3 { margin-top: 0; }
           textarea { width: 100%; min-height: 220px; }
           input, textarea, button { font: inherit; margin-top: 8px; }
-          button { padding: 10px 14px; cursor: pointer; }
+          button { padding: 12px 18px; cursor: pointer; font-weight: bold; }
           label { display: block; margin-top: 14px; font-weight: bold; }
           .hint { color: #555; font-size: 0.95rem; }
         </style>
@@ -37,19 +39,26 @@ def home():
           <p>Current endpoint: <code>POST /fill</code></p>
         </div>
         <div class=\"card\">
-          <h2>Test PDF Fill</h2>
+          <h2>Fill a PDF</h2>
           <form action=\"/fill\" method=\"post\" enctype=\"multipart/form-data\">
-            <label>Target PDF form to fill</label>
-            <input type=\"file\" name=\"pdf\" accept=\"application/pdf\" required />
-            <p class=\"hint\">Upload the blank form PDF here.</p>
+            <div class=\"step\">
+              <h3>1. PDF that needs to be filled</h3>
+              <label>Upload blank form PDF</label>
+              <input type=\"file\" name=\"pdf\" accept=\"application/pdf\" required />
+              <p class=\"hint\">This is the original form. The app types answers onto this PDF.</p>
+            </div>
 
-            <label>Answer prompt PDF or text file</label>
-            <input type=\"file\" name=\"prompt_file\" accept=\"application/pdf,text/plain,.txt\" />
-            <p class=\"hint\">Optional. Upload your AI prompt PDF or a .txt answer file.</p>
+            <div class=\"step\">
+              <h3>2. Answers / source prompt</h3>
+              <label>Upload answers PDF or text file</label>
+              <input type=\"file\" name=\"prompt_file\" accept=\"application/pdf,text/plain,.txt\" />
+              <p class=\"hint\">Upload the AI answer prompt PDF or a text file with the answers.</p>
 
-            <label>Answer prompt text</label>
-            <textarea name=\"prompt\">NAME:\nLaurie A. Milward\n\nDATE OF BIRTH:\n11/11/1959</textarea>
-            <p class=\"hint\">You can paste the prompt here, upload a prompt file above, or use both.</p>
+              <label>Or paste answers here</label>
+              <textarea name=\"prompt\" placeholder=\"Paste answers here, for example:\n\nNAME:\nLaurie A. Milward\n\nDATE OF BIRTH:\n11/11/1959\"></textarea>
+              <p class=\"hint\">Use the upload, the text box, or both.</p>
+            </div>
+
             <br />
             <button type=\"submit\">Fill PDF</button>
           </form>
