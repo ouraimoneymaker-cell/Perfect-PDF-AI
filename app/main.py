@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 import tempfile
 import shutil
@@ -28,6 +28,7 @@ def home():
           button { padding: 12px 18px; cursor: pointer; font-weight: bold; }
           label { display: block; margin-top: 14px; font-weight: bold; }
           .hint { color: #555; font-size: 0.95rem; }
+          .warning { background: #fff3cd; border: 1px solid #ffe08a; border-radius: 8px; padding: 10px; }
         </style>
       </head>
       <body>
@@ -38,6 +39,9 @@ def home():
           <p>API docs: <a href=\"/docs\">/docs</a></p>
           <p>Current endpoint: <code>POST /fill</code></p>
         </div>
+        <div class=\"card warning\">
+          <strong>Important:</strong> Step 1 must be the blank form PDF only. Step 2 is where the answers/source records go.
+        </div>
         <div class=\"card\">
           <h2>Fill a PDF</h2>
           <form action=\"/fill\" method=\"post\" enctype=\"multipart/form-data\">
@@ -45,14 +49,14 @@ def home():
               <h3>1. PDF that needs to be filled</h3>
               <label>Upload blank form PDF</label>
               <input type=\"file\" name=\"pdf\" accept=\"application/pdf\" required />
-              <p class=\"hint\">This is the original form. The app types answers onto this PDF.</p>
+              <p class=\"hint\">This must be the blank form, not the medical/source packet.</p>
             </div>
 
             <div class=\"step\">
               <h3>2. Answers / source prompt</h3>
               <label>Upload answers PDF or text file</label>
               <input type=\"file\" name=\"prompt_file\" accept=\"application/pdf,text/plain,.txt\" />
-              <p class=\"hint\">Upload the AI answer prompt PDF or a text file with the answers.</p>
+              <p class=\"hint\">Upload the AI answer prompt PDF, source records, or a text file with the answers.</p>
 
               <label>Or paste answers here</label>
               <textarea name=\"prompt\" placeholder=\"Paste answers here, for example:\n\nNAME:\nLaurie A. Milward\n\nDATE OF BIRTH:\n11/11/1959\"></textarea>
@@ -88,6 +92,54 @@ def extract_prompt_file_text(prompt_file: UploadFile | None) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
+def validate_target_pdf(input_path: str) -> None:
+    import fitz
+
+    doc = fitz.open(input_path)
+    page_count = len(doc)
+    sample_text = "\n".join(doc[i].get_text() for i in range(min(page_count, 10))).lower()
+
+    source_packet_markers = [
+        "supporting medical records index",
+        "patient-style medical history attachment",
+        "mychart",
+        "mass general brigham",
+        "office visit",
+        "cbc and differential",
+        "comprehensive metabolic panel",
+    ]
+
+    form_markers = [
+        "initial nutrition visit",
+        "health information",
+        "date of birth",
+        "history of present illness",
+        "scar history",
+        "dental history questionnaire",
+    ]
+
+    source_hits = [marker for marker in source_packet_markers if marker in sample_text]
+    form_hits = [marker for marker in form_markers if marker in sample_text]
+
+    if page_count > 25 and source_hits:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The PDF uploaded in Step 1 looks like a source/medical packet, not the blank form to fill. "
+                "Upload the blank form PDF in Step 1 and upload the source records or answers in Step 2."
+            ),
+        )
+
+    if page_count > 25 and not form_hits:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The PDF uploaded in Step 1 has too many pages and does not look like the blank form. "
+                "Upload only the blank form PDF in Step 1."
+            ),
+        )
+
+
 @app.post("/fill")
 async def fill_pdf(
     pdf: UploadFile = File(...),
@@ -100,6 +152,8 @@ async def fill_pdf(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
         shutil.copyfileobj(pdf.file, temp_pdf)
         input_path = temp_pdf.name
+
+    validate_target_pdf(input_path)
 
     output_path = input_path.replace(".pdf", "_filled.pdf")
 
