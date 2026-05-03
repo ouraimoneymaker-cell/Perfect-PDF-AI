@@ -11,15 +11,27 @@ def clean_answer(value: str) -> str:
     return value or UNKNOWN_VALUE
 
 
+def normalize_key(label: str) -> str:
+    label = (label or "").lower().strip()
+    label = re.sub(r"[^a-z0-9]+", "_", label)
+    label = re.sub(r"_+", "_", label).strip("_")
+    return label
+
+
 def parse_label_answer_prompt(prompt_text: str) -> Dict[str, str]:
     """
-    Deterministic parser for AI-generated answer prompts.
+    Deterministic parser for AI/source answer prompts.
 
-    Expected style:
-        FIELD LABEL:
-        answer text
+    Supports:
+      FIELD LABEL:
+      answer text
 
-    This intentionally avoids guessing. It only extracts explicit label/value pairs.
+      FIELD LABEL: answer text
+
+      1. answer text
+      Scar 1: answer text
+
+    It does not infer missing facts; missing fields fall back to UNKNOWN_VALUE.
     """
     answers: Dict[str, str] = {}
     lines = (prompt_text or "").splitlines()
@@ -33,9 +45,31 @@ def parse_label_answer_prompt(prompt_text: str) -> Dict[str, str]:
         current_label = None
         buffer = []
 
+    numbered_re = re.compile(r"^(?:scar\s*)?(\d{1,2})[\.)]\s*(.+)$", re.IGNORECASE)
+    inline_label_re = re.compile(r"^([A-Za-z0-9][A-Za-z0-9 /&().,'\-]{0,90}?):\s*(.*)$")
+
     for raw in lines:
         line = raw.strip()
         if not line:
+            continue
+
+        numbered = numbered_re.match(line)
+        if numbered:
+            flush()
+            answers[normalize_key(numbered.group(1))] = clean_answer(numbered.group(2))
+            answers[normalize_key(f"scar {numbered.group(1)}")] = clean_answer(numbered.group(2))
+            continue
+
+        inline = inline_label_re.match(line)
+        if inline:
+            flush()
+            label = inline.group(1).strip()
+            value = inline.group(2).strip()
+            if value:
+                answers[normalize_key(label)] = clean_answer(value)
+            else:
+                current_label = label
+                buffer = []
             continue
 
         if line.endswith(":") and len(line) <= 90:
@@ -47,13 +81,6 @@ def parse_label_answer_prompt(prompt_text: str) -> Dict[str, str]:
 
     flush()
     return answers
-
-
-def normalize_key(label: str) -> str:
-    label = (label or "").lower().strip()
-    label = re.sub(r"[^a-z0-9]+", "_", label)
-    label = re.sub(r"_+", "_", label).strip("_")
-    return label
 
 
 def get_answer(answers: Dict[str, str], *candidate_labels: str) -> str:
