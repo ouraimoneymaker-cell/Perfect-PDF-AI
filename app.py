@@ -1,52 +1,80 @@
 #!/usr/bin/env python3
 """
-Perfect PDF AI — simple deployable document reader and answer submission app.
+Perfect PDF AI — deployable PDF/document reader, answer intake, and Stripe-ready app.
 
-Users can:
-1. Upload a document.
-2. Read extracted text in the browser.
-3. Upload a separate answers file.
-
-Supported document text extraction:
-- .txt / .md: native text read
-- .pdf: PyMuPDF when installed; pdftotext fallback when available
-- .docx: docx2txt command fallback when available
+Features:
+- Front end served by FastAPI
+- Static CSS and JS support when present
+- Upload PDF/TXT/MD/CSV/DOCX documents
+- Extract readable text from PDFs with PyMuPDF
+- Upload separate answer files
+- JSON API endpoints for integrations
+- Optional Stripe payment link / checkout redirect by environment variables
+- Health endpoint for Render
 """
 
 from __future__ import annotations
 
 import html
+import os
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 UPLOAD_DIR = BASE_DIR / "uploads"
 DOCUMENT_DIR = UPLOAD_DIR / "documents"
 ANSWER_DIR = UPLOAD_DIR / "answers"
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 
-app = FastAPI(title="Perfect PDF AI", version="1.0.0")
+APP_NAME = os.getenv("APP_NAME", "Perfect PDF AI")
+STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
+STRIPE_REQUIRE_PAYMENT = os.getenv("STRIPE_REQUIRE_PAYMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+app = FastAPI(title=APP_NAME, version="1.1.0")
 
 
 def ensure_dirs() -> None:
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
     DOCUMENT_DIR.mkdir(parents=True, exist_ok=True)
     ANSWER_DIR.mkdir(parents=True, exist_ok=True)
 
 
 ensure_dirs()
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 def safe_filename(original: str) -> str:
     name = Path(original or "upload.bin").name.strip() or "upload.bin"
-    cleaned = "".join(ch if ch.isalnum() or ch in "._- " else "_" for ch in name).strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name).strip("._-")
     return cleaned or "upload.bin"
+
+
+def payment_required_response() -> HTMLResponse:
+    if STRIPE_PAYMENT_LINK:
+        body = f"""
+        <section class="card">
+          <h1>Unlock Uploads</h1>
+          <p>Payment is required before uploading documents.</p>
+          <a class="button" href="{html.escape(STRIPE_PAYMENT_LINK)}">Continue to Secure Checkout</a>
+          <p class="muted">Set STRIPE_REQUIRE_PAYMENT=false to disable this gate.</p>
+        </section>
+        """
+    else:
+        body = """
+        <section class="card">
+          <h1>Payment Setup Needed</h1>
+          <p>Payment is currently required, but no STRIPE_PAYMENT_LINK is configured.</p>
+        </section>
+        """
+    return HTMLResponse(page_shell("Payment Required", body), status_code=402)
 
 
 def save_upload(upload: UploadFile, destination_dir: Path) -> Path:
@@ -64,9 +92,8 @@ def save_upload(upload: UploadFile, destination_dir: Path) -> Path:
             total += len(chunk)
             if total > MAX_UPLOAD_BYTES:
                 destination.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail="File is too large. Maximum upload size is 25 MB.")
+                raise HTTPException(status_code=413, detail="File is too large.")
             out.write(chunk)
-
     return destination
 
 
@@ -95,7 +122,7 @@ def extract_pdf_text(path: Path) -> str:
         if completed.returncode == 0 and completed.stdout.strip():
             return completed.stdout.strip()
 
-    return "PDF uploaded successfully, but text extraction was not available for this file."
+    return "PDF uploaded successfully, but readable text was not found. Try a clearer source PDF."
 
 
 def extract_docx_text(path: Path) -> str:
@@ -108,7 +135,7 @@ def extract_docx_text(path: Path) -> str:
         )
         if completed.returncode == 0 and completed.stdout.strip():
             return completed.stdout.strip()
-    return "DOCX uploaded successfully, but text extraction was not available on this server."
+    return "DOCX uploaded successfully, but DOCX preview is not available on this server."
 
 
 def extract_text(path: Path) -> str:
@@ -119,7 +146,7 @@ def extract_text(path: Path) -> str:
         return extract_pdf_text(path)
     if suffix == ".docx":
         return extract_docx_text(path)
-    return f"Unsupported preview type: {suffix or 'unknown'}. The file was still uploaded."
+    return f"Unsupported preview type: {suffix or 'unknown'}. The file was uploaded."
 
 
 def page_shell(title: str, body: str) -> str:
@@ -129,51 +156,65 @@ def page_shell(title: str, body: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
-  <style>
-    :root {{ color-scheme: light dark; }}
-    body {{ margin: 0; font-family: Arial, Helvetica, sans-serif; background: #0f172a; color: #e5e7eb; }}
-    .wrap {{ max-width: 980px; margin: 0 auto; padding: 28px 18px 56px; }}
-    .card {{ background: #111827; border: 1px solid #334155; border-radius: 18px; padding: 24px; box-shadow: 0 12px 36px rgba(0,0,0,.25); }}
-    h1 {{ margin: 0 0 10px; font-size: clamp(30px, 5vw, 54px); letter-spacing: -0.04em; }}
-    h2 {{ margin-top: 26px; }}
-    p {{ color: #cbd5e1; line-height: 1.55; }}
-    form {{ display: grid; gap: 14px; margin-top: 18px; }}
-    input[type=file] {{ padding: 18px; border: 1px dashed #64748b; border-radius: 14px; background: #020617; color: #e5e7eb; }}
-    button, .button {{ display: inline-block; width: fit-content; border: 0; border-radius: 12px; padding: 13px 18px; font-weight: 700; background: #38bdf8; color: #020617; cursor: pointer; text-decoration: none; }}
-    pre {{ white-space: pre-wrap; word-wrap: break-word; max-height: 62vh; overflow: auto; background: #020617; border: 1px solid #334155; padding: 18px; border-radius: 14px; line-height: 1.45; }}
-    .muted {{ color: #94a3b8; font-size: 14px; }}
-    .success {{ border-color: #22c55e; }}
-  </style>
+  <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <main class="wrap">{body}</main>
+  <script src="/static/app.js"></script>
 </body>
 </html>"""
 
 
 @app.get("/health")
 def health() -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "perfect-pdf-ai"})
+    return JSONResponse({"ok": True, "service": "perfect-pdf-ai", "version": "1.1.0"})
+
+
+@app.get("/config")
+def config() -> JSONResponse:
+    return JSONResponse({
+        "app_name": APP_NAME,
+        "stripe_enabled": bool(STRIPE_PAYMENT_LINK),
+        "payment_required": STRIPE_REQUIRE_PAYMENT,
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+    })
+
+
+@app.get("/checkout")
+def checkout() -> RedirectResponse:
+    if not STRIPE_PAYMENT_LINK:
+        raise HTTPException(status_code=503, detail="Stripe payment link is not configured.")
+    return RedirectResponse(url=STRIPE_PAYMENT_LINK)
 
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
-    body = """
-    <section class="card">
-      <h1>Perfect PDF AI</h1>
+    checkout_button = ""
+    if STRIPE_PAYMENT_LINK:
+        checkout_button = '<a class="button secondary" href="/checkout">Unlock with Stripe</a>'
+    body = f"""
+    <section class="hero card">
+      <p class="eyebrow">PDF reader + answer intake</p>
+      <h1>{html.escape(APP_NAME)}</h1>
       <p>Upload a document, read the extracted text, then upload the user answers in the next box.</p>
-      <form method="post" action="/upload" enctype="multipart/form-data">
+      <form method="post" action="/upload" enctype="multipart/form-data" class="upload-form">
         <input type="file" name="file" accept=".pdf,.txt,.md,.csv,.docx" required>
-        <button type="submit">Upload and Read</button>
+        <div class="actions">
+          <button type="submit">Upload and Read</button>
+          {checkout_button}
+        </div>
       </form>
-      <p class="muted">Supported previews: PDF, TXT, MD, CSV, DOCX. Max file size: 25 MB.</p>
+      <p class="muted">Supported previews: PDF, TXT, MD, CSV, DOCX. Max file size: {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.</p>
     </section>
     """
-    return HTMLResponse(page_shell("Perfect PDF AI", body))
+    return HTMLResponse(page_shell(APP_NAME, body))
 
 
 @app.post("/upload", response_class=HTMLResponse)
 def upload_document(file: UploadFile = File(...)) -> HTMLResponse:
+    if STRIPE_REQUIRE_PAYMENT:
+        return payment_required_response()
+
     path = save_upload(file, DOCUMENT_DIR)
     text = extract_text(path)
     escaped_name = html.escape(path.name.split("_", 1)[-1])
@@ -187,14 +228,23 @@ def upload_document(file: UploadFile = File(...)) -> HTMLResponse:
       <pre>{escaped_text}</pre>
       <h2>Upload Answers</h2>
       <p>After reading the document, upload the answers file here.</p>
-      <form method="post" action="/submit-answers" enctype="multipart/form-data">
+      <form method="post" action="/submit-answers" enctype="multipart/form-data" class="upload-form">
         <input type="file" name="file" required>
         <button type="submit">Upload Answers</button>
       </form>
-      <p><a class="button" href="/">Start Over</a></p>
+      <p><a class="button secondary" href="/">Start Over</a></p>
     </section>
     """
     return HTMLResponse(page_shell("Document Uploaded", body))
+
+
+@app.post("/api/upload")
+def api_upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    if STRIPE_REQUIRE_PAYMENT:
+        return JSONResponse({"ok": False, "error": "payment_required", "payment_link": STRIPE_PAYMENT_LINK}, status_code=402)
+    path = save_upload(file, DOCUMENT_DIR)
+    text = extract_text(path)
+    return JSONResponse({"ok": True, "file_name": path.name.split("_", 1)[-1], "stored_name": path.name, "text": text})
 
 
 @app.post("/submit-answers", response_class=HTMLResponse)
@@ -209,6 +259,12 @@ def submit_answers(file: UploadFile = File(...)) -> HTMLResponse:
     </section>
     """
     return HTMLResponse(page_shell("Answers Uploaded", body))
+
+
+@app.post("/api/submit-answers")
+def api_submit_answers(file: UploadFile = File(...)) -> JSONResponse:
+    path = save_upload(file, ANSWER_DIR)
+    return JSONResponse({"ok": True, "file_name": path.name.split("_", 1)[-1], "stored_name": path.name})
 
 
 @app.get("/submit_answers")
