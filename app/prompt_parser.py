@@ -90,6 +90,7 @@ _REAL_INLINE_PREFIXES = (
     "describe",
     "occupational",
     "advanced directives",
+    "this patient history was completed by",
     "signature",
     "dental",
     "scar",
@@ -100,7 +101,7 @@ def clean_answer(value: str) -> str:
     value = (value or "").strip()
     value = re.sub(r"\s+", " ", value)
     value = value.replace("VERIFY", UNKNOWN_VALUE)
-    return value or UNKNOWN_VALUE
+    return value
 
 
 def normalize_key(label: str) -> str:
@@ -159,8 +160,9 @@ def parse_label_answer_prompt(prompt_text: str) -> Dict[str, str]:
         if numbered:
             flush()
             value = clean_answer(numbered.group(2))
-            answers[normalize_key(numbered.group(1))] = value
-            answers[normalize_key(f"scar {numbered.group(1)}")] = value
+            if value:
+                answers[normalize_key(numbered.group(1))] = value
+                answers[normalize_key(f"scar {numbered.group(1)}")] = value
             continue
 
         inline = inline_label_re.match(line)
@@ -200,4 +202,4 @@ def get_answer(answers: Dict[str, str], *candidate_labels: str) -> str:
         key = normalize_key(label)
         if key in answers and answers[key]:
             return clean_answer(answers[key])
-    return UNKNOWN_VALUE
+    return ""
