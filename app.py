@@ -29,7 +29,7 @@ APP_NAME: Final[str] = os.getenv("APP_NAME", "Perfect PDF AI")
 STRIPE_PAYMENT_LINK: Final[str] = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
 STRIPE_REQUIRE_PAYMENT: Final[bool] = os.getenv("STRIPE_REQUIRE_PAYMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-app = FastAPI(title=APP_NAME, version="1.2.0")
+app = FastAPI(title=APP_NAME, version="1.3.0")
 
 
 def ensure_dirs() -> None:
@@ -158,11 +158,17 @@ def page_shell(title: str, body: str) -> str:
 
 
 def payment_required_response() -> HTMLResponse:
+    checkout_html = ""
+    if STRIPE_PAYMENT_LINK:
+        checkout_html = '<a class="button" href="/checkout">Continue to Secure Checkout</a>'
+    else:
+        checkout_html = '<p class="muted">Stripe is not configured yet.</p>'
+
     body = f"""
     <section class="card">
       <h1>Unlock Uploads</h1>
       <p>Payment is required before uploading documents.</p>
-      {'<a class="button" href="/checkout">Continue to Secure Checkout</a>' if STRIPE_PAYMENT_LINK else '<p class="muted">Stripe is not configured yet.</p>'}
+      {checkout_html}
     </section>
     """
     return HTMLResponse(page_shell("Payment Required", body), status_code=402)
@@ -170,7 +176,7 @@ def payment_required_response() -> HTMLResponse:
 
 @app.get("/health")
 def health() -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "perfect-pdf-ai", "version": "1.2.0"})
+    return JSONResponse({"ok": True, "service": "perfect-pdf-ai", "version": "1.3.0"})
 
 
 @app.get("/config")
