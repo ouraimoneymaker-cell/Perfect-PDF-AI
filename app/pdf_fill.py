@@ -1,6 +1,7 @@
 import fitz  # PyMuPDF
 
 from app.prompt_parser import normalize_key, parse_label_answer_prompt
+from app.templates import build_dr_dan_template
 
 
 def fit_text_to_box(page, text, rect):
@@ -55,6 +56,27 @@ def fill_form_fields(doc, answers):
     return filled
 
 
+def fill_template_fields(doc, answers):
+    filled = False
+    template = build_dr_dan_template(answers)
+
+    for field in template:
+        page_index = field["page"]
+        if page_index < 0 or page_index >= len(doc):
+            continue
+
+        value = str(field.get("value", "")).strip()
+        if not value:
+            continue
+
+        page = doc[page_index]
+        rect = fitz.Rect(field["rect"])
+        fit_text_to_box(page, value, rect)
+        filled = True
+
+    return filled
+
+
 def fill_fallback_text(doc, answers):
     if not answers or len(doc) == 0:
         return False
@@ -86,6 +108,8 @@ def fill_pdf_with_template(input_pdf, output_pdf, prompt_text):
 
     form_filled = fill_form_fields(doc, answers)
     if not form_filled:
-        fill_fallback_text(doc, answers)
+        template_filled = fill_template_fields(doc, answers)
+        if not template_filled:
+            fill_fallback_text(doc, answers)
 
     doc.save(output_pdf, garbage=4, deflate=True)
