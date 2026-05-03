@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
 Perfect PDF AI — deployable PDF/document reader, answer intake, and Stripe-ready app.
-
-Features:
-- Front end served by FastAPI
-- Static CSS and JS support when present
-- Upload PDF/TXT/MD/CSV/DOCX documents
-- Extract readable text from PDFs with PyMuPDF
-- Upload separate answer files
-- JSON API endpoints for integrations
-- Optional Stripe payment link / checkout redirect by environment variables
-- Health endpoint for Render
 """
 
 from __future__ import annotations
@@ -21,23 +11,25 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
+from typing import Final
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-UPLOAD_DIR = BASE_DIR / "uploads"
-DOCUMENT_DIR = UPLOAD_DIR / "documents"
-ANSWER_DIR = UPLOAD_DIR / "answers"
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+BASE_DIR: Final[Path] = Path(__file__).resolve().parent
+STATIC_DIR: Final[Path] = BASE_DIR / "static"
+UPLOAD_DIR: Final[Path] = BASE_DIR / "uploads"
+DOCUMENT_DIR: Final[Path] = UPLOAD_DIR / "documents"
+ANSWER_DIR: Final[Path] = UPLOAD_DIR / "answers"
+MAX_UPLOAD_BYTES: Final[int] = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+ALLOWED_EXTENSIONS: Final[set[str]] = {".pdf", ".txt", ".md", ".csv", ".docx"}
 
-APP_NAME = os.getenv("APP_NAME", "Perfect PDF AI")
-STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
-STRIPE_REQUIRE_PAYMENT = os.getenv("STRIPE_REQUIRE_PAYMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
+APP_NAME: Final[str] = os.getenv("APP_NAME", "Perfect PDF AI")
+STRIPE_PAYMENT_LINK: Final[str] = os.getenv("STRIPE_PAYMENT_LINK", "").strip()
+STRIPE_REQUIRE_PAYMENT: Final[bool] = os.getenv("STRIPE_REQUIRE_PAYMENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.2.0")
 
 
 def ensure_dirs() -> None:
@@ -48,7 +40,6 @@ def ensure_dirs() -> None:
 
 ensure_dirs()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 def safe_filename(original: str) -> str:
@@ -57,29 +48,19 @@ def safe_filename(original: str) -> str:
     return cleaned or "upload.bin"
 
 
-def payment_required_response() -> HTMLResponse:
-    if STRIPE_PAYMENT_LINK:
-        body = f"""
-        <section class="card">
-          <h1>Unlock Uploads</h1>
-          <p>Payment is required before uploading documents.</p>
-          <a class="button" href="{html.escape(STRIPE_PAYMENT_LINK)}">Continue to Secure Checkout</a>
-          <p class="muted">Set STRIPE_REQUIRE_PAYMENT=false to disable this gate.</p>
-        </section>
-        """
-    else:
-        body = """
-        <section class="card">
-          <h1>Payment Setup Needed</h1>
-          <p>Payment is currently required, but no STRIPE_PAYMENT_LINK is configured.</p>
-        </section>
-        """
-    return HTMLResponse(page_shell("Payment Required", body), status_code=402)
+def validate_extension(filename: str) -> None:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise HTTPException(status_code=415, detail=f"Unsupported file type. Allowed: {allowed}")
 
 
-def save_upload(upload: UploadFile, destination_dir: Path) -> Path:
+def save_upload(upload: UploadFile, destination_dir: Path, *, validate_type: bool = True) -> Path:
     ensure_dirs()
     filename = safe_filename(upload.filename or "upload.bin")
+    if validate_type:
+        validate_extension(filename)
+
     unique_name = f"{uuid.uuid4().hex}_{filename}"
     destination = destination_dir / unique_name
 
@@ -92,8 +73,13 @@ def save_upload(upload: UploadFile, destination_dir: Path) -> Path:
             total += len(chunk)
             if total > MAX_UPLOAD_BYTES:
                 destination.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail="File is too large.")
+                raise HTTPException(status_code=413, detail=f"File is too large. Max size is {MAX_UPLOAD_BYTES} bytes.")
             out.write(chunk)
+
+    if total == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file was empty.")
+
     return destination
 
 
@@ -103,14 +89,18 @@ def extract_pdf_text(path: Path) -> str:
 
         pieces: list[str] = []
         with fitz.open(path) as doc:
+            if doc.page_count == 0:
+                return "PDF uploaded successfully, but it had no pages."
             for page_number, page in enumerate(doc, start=1):
                 text = page.get_text("text") or ""
                 pieces.append(f"\n--- Page {page_number} ---\n{text}")
         result = "\n".join(pieces).strip()
         if result:
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        fallback_note = f"PyMuPDF extraction failed: {type(exc).__name__}."
+    else:
+        fallback_note = "No readable PDF text was found by PyMuPDF."
 
     if shutil.which("pdftotext"):
         completed = subprocess.run(
@@ -118,11 +108,12 @@ def extract_pdf_text(path: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=30,
         )
         if completed.returncode == 0 and completed.stdout.strip():
             return completed.stdout.strip()
 
-    return "PDF uploaded successfully, but readable text was not found. Try a clearer source PDF."
+    return f"PDF uploaded successfully, but readable text was not found. {fallback_note} Try a clearer source PDF."
 
 
 def extract_docx_text(path: Path) -> str:
@@ -132,6 +123,7 @@ def extract_docx_text(path: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=30,
         )
         if completed.returncode == 0 and completed.stdout.strip():
             return completed.stdout.strip()
@@ -165,9 +157,20 @@ def page_shell(title: str, body: str) -> str:
 </html>"""
 
 
+def payment_required_response() -> HTMLResponse:
+    body = f"""
+    <section class="card">
+      <h1>Unlock Uploads</h1>
+      <p>Payment is required before uploading documents.</p>
+      {'<a class="button" href="/checkout">Continue to Secure Checkout</a>' if STRIPE_PAYMENT_LINK else '<p class="muted">Stripe is not configured yet.</p>'}
+    </section>
+    """
+    return HTMLResponse(page_shell("Payment Required", body), status_code=402)
+
+
 @app.get("/health")
 def health() -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "perfect-pdf-ai", "version": "1.1.0"})
+    return JSONResponse({"ok": True, "service": "perfect-pdf-ai", "version": "1.2.0"})
 
 
 @app.get("/config")
@@ -177,6 +180,7 @@ def config() -> JSONResponse:
         "stripe_enabled": bool(STRIPE_PAYMENT_LINK),
         "payment_required": STRIPE_REQUIRE_PAYMENT,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "allowed_extensions": sorted(ALLOWED_EXTENSIONS),
     })
 
 
@@ -189,9 +193,7 @@ def checkout() -> RedirectResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
-    checkout_button = ""
-    if STRIPE_PAYMENT_LINK:
-        checkout_button = '<a class="button secondary" href="/checkout">Unlock with Stripe</a>'
+    checkout_button = '<a class="button secondary" href="/checkout">Unlock with Stripe</a>' if STRIPE_PAYMENT_LINK else ""
     body = f"""
     <section class="hero card">
       <p class="eyebrow">PDF reader + answer intake</p>
@@ -249,7 +251,7 @@ def api_upload_document(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/submit-answers", response_class=HTMLResponse)
 def submit_answers(file: UploadFile = File(...)) -> HTMLResponse:
-    path = save_upload(file, ANSWER_DIR)
+    path = save_upload(file, ANSWER_DIR, validate_type=False)
     escaped_name = html.escape(path.name.split("_", 1)[-1])
     body = f"""
     <section class="card success">
@@ -263,7 +265,7 @@ def submit_answers(file: UploadFile = File(...)) -> HTMLResponse:
 
 @app.post("/api/submit-answers")
 def api_submit_answers(file: UploadFile = File(...)) -> JSONResponse:
-    path = save_upload(file, ANSWER_DIR)
+    path = save_upload(file, ANSWER_DIR, validate_type=False)
     return JSONResponse({"ok": True, "file_name": path.name.split("_", 1)[-1], "stored_name": path.name})
 
 
