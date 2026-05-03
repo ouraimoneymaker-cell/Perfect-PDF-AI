@@ -7,11 +7,10 @@ def _answer(answers, *labels):
 
 def build_dr_dan_template(answers):
     """
-    Dr. Dan intake form overlay template.
+    Dr. Dan packet overlay template.
 
-    This template is intentionally limited to the fillable intake packet pages.
-    It leaves unknown fields blank through prompt_parser.get_answer behavior
-    and avoids spraying fallback text across the form.
+    Supports the intake pages plus the short waiver/privacy pages shown in the
+    uploaded packet. Unknown fields stay blank through prompt_parser.get_answer.
     """
     name = _answer(answers, "name", "full name", "patient name", "name last first mi")
     date = _answer(answers, "date", "today's date", "today date")
@@ -23,8 +22,29 @@ def build_dr_dan_template(answers):
     phone = _answer(answers, "cell phone", "phone", "phone in records")
     email = _answer(answers, "email", "email address")
     pcp = _answer(answers, "primary care physician", "primary care doctor", "pcp")
+    city = _answer(answers, "city")
+    state = _answer(answers, "state")
+    zip_code = _answer(answers, "zip", "zip code")
+    signature = _answer(answers, "signature", "print her name", "name")
 
     return [
+        # Waiver / consent page near bottom - screenshot page 3 of 5
+        {"page": 2, "rect": [145, 540, 372, 558], "value": name},
+        {"page": 2, "rect": [405, 540, 555, 558], "value": ""},
+        {"page": 2, "rect": [120, 568, 322, 586], "value": city},
+        {"page": 2, "rect": [62, 596, 126, 614], "value": state},
+        {"page": 2, "rect": [166, 596, 236, 614], "value": zip_code},
+        {"page": 2, "rect": [292, 596, 430, 614], "value": phone},
+        {"page": 2, "rect": [128, 624, 390, 642], "value": email},
+        {"page": 2, "rect": [65, 650, 340, 670], "value": signature},
+
+        # HIPAA acknowledgement page - screenshot page 4 of 5
+        {"page": 3, "rect": [190, 595, 585, 615], "value": name},
+        {"page": 3, "rect": [170, 627, 420, 647], "value": signature},
+        {"page": 3, "rect": [478, 627, 598, 647], "value": date},
+        {"page": 3, "rect": [275, 705, 585, 725], "value": ""},
+        {"page": 3, "rect": [210, 735, 410, 755], "value": ""},
+
         # Page 1 - patient information and presenting concerns
         {"page": 0, "rect": [78, 126, 168, 142], "value": date},
         {"page": 0, "rect": [238, 126, 548, 142], "value": name},
@@ -89,7 +109,7 @@ def build_dr_dan_template(answers):
         {"page": 3, "rect": [50, 578, 565, 678], "value": _answer(answers, "occupational history", "social history")},
         {"page": 3, "rect": [228, 700, 565, 720], "value": _answer(answers, "advanced directives")},
         {"page": 3, "rect": [234, 728, 405, 748], "value": _answer(answers, "this patient history was completed by")},
-        {"page": 3, "rect": [88, 752, 318, 772], "value": _answer(answers, "signature", "print her name", "name")},
+        {"page": 3, "rect": [88, 752, 318, 772], "value": signature},
         {"page": 3, "rect": [458, 752, 565, 772], "value": date},
 
         # Page 5 - dental history
