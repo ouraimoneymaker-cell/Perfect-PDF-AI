@@ -1,11 +1,11 @@
 document.addEventListener("DOMContentLoaded", () => {
-  const forms = document.querySelectorAll("form.upload-form");
+  const uploadForms = document.querySelectorAll("form.upload-form");
 
-  forms.forEach((form) => {
+  uploadForms.forEach((form) => {
     const submitButton = form.querySelector("button[type='submit']");
     const fileInput = form.querySelector("input[type='file']");
-
     let status = form.querySelector(".form-status");
+
     if (!status) {
       status = document.createElement("p");
       status.className = "form-status muted";
@@ -13,27 +13,25 @@ document.addEventListener("DOMContentLoaded", () => {
       form.appendChild(status);
     }
 
-    if (submitButton) {
-      submitButton.disabled = false;
-    }
-
     form.addEventListener("submit", (event) => {
       if (fileInput && fileInput.required && (!fileInput.files || fileInput.files.length === 0)) {
         event.preventDefault();
-        status.textContent = "Choose a file first, then tap the upload button.";
-        if (submitButton) {
-          submitButton.disabled = false;
-        }
+        status.textContent = "Choose a file first.";
         return;
       }
 
-      status.textContent = "Uploading. Please keep this page open.";
-
+      status.textContent = fileInput ? "Uploading and analyzing…" : "Working…";
       if (submitButton) {
         submitButton.disabled = true;
-        submitButton.dataset.originalText = submitButton.textContent || "Upload";
-        submitButton.textContent = "Uploading...";
+        submitButton.dataset.originalText = submitButton.textContent || "Submit";
+        submitButton.textContent = fileInput ? "Uploading…" : "Working…";
       }
+    });
+  });
+
+  document.querySelectorAll(".field-row input").forEach((input) => {
+    input.addEventListener("input", () => {
+      input.closest(".field-row")?.querySelector(".confidence")?.remove();
     });
   });
 });

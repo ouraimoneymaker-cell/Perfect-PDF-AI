@@ -1,9 +1,40 @@
+databases:
+  - name: perfect-pdf-ai-db
+    plan: free
+    region: oregon
+
 services:
   - type: web
     name: perfect-pdf-ai
-    env: python
+    runtime: python
     plan: free
+    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    autoDeploy: true
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: APP_NAME
+        value: Perfect PDF AI
+      - key: ENVIRONMENT
+        value: production
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: MAX_UPLOAD_BYTES
+        value: "26214400"
+      - key: FREE_COMPLETIONS
+        value: "1"
+      - key: STRIPE_REQUIRE_PAYMENT
+        value: "false"
+      - key: PAYMENT_CREDITS
+        value: "1"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: perfect-pdf-ai-db
+          property: connectionString
+      - key: APP_SECRET_KEY
+        generateValue: true
+      - key: STRIPE_PAYMENT_LINK
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
