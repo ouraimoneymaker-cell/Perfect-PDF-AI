@@ -2,13 +2,21 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, "launch/**"]
   pull_request:
     branches: [main]
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: test
+      COOKIE_SECURE: "false"
+      APP_SECRET_KEY: test-secret-key-that-is-long-enough-for-tests-123456789
+      DATABASE_URL: sqlite:////tmp/perfect_pdf_ai_ci.sqlite3
+      STRIPE_REQUIRE_PAYMENT: "false"
+      STRIPE_PAYMENT_LINK: https://buy.stripe.com/test_perfect_pdf_ai
+      STRIPE_WEBHOOK_SECRET: whsec_perfect_pdf_ai_test
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -20,6 +28,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Compile application
+        run: python -m py_compile app.py
 
       - name: Run tests
         run: pytest -q

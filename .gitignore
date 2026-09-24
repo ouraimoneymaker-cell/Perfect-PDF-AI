@@ -5,6 +5,7 @@ __pycache__/
 venv/
 .env
 .DS_Store
+data/
 uploads/documents/*
 uploads/answers/*
 !uploads/documents/.gitkeep
