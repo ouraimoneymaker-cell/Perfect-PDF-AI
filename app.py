@@ -30,7 +30,7 @@ from docx import Document as DocxDocument
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, create_engine, select, update
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, create_engine, delete, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -940,6 +940,7 @@ def page_shell(title: str, body: str, request: Optional[Request] = None) -> str:
           <a class="brand" href="/">{html.escape(APP_NAME)}</a>
           <div class="topbar-right">
             <span class="muted">{html.escape(user.email)}</span>
+            <a href="/account">Account</a>
             <form method="post" action="/logout" class="inline-form">
               <input type="hidden" name="csrf" value="{csrf}">
               <button class="link-button" type="submit">Logout</button>
@@ -968,6 +969,10 @@ def page_shell(title: str, body: str, request: Optional[Request] = None) -> str:
   <main class="wrap">
     {nav}
     {body}
+    <footer class="site-footer">
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+    </footer>
   </main>
   <script src="/static/app.js"></script>
 </body>
@@ -1170,6 +1175,107 @@ def home(request: Request) -> HTMLResponse:
     </section>
     """
     return HTMLResponse(page_shell(APP_NAME, body, request))
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page(request: Request) -> HTMLResponse:
+    body = """
+    <section class="card">
+      <p class="eyebrow">Privacy</p>
+      <h1>Privacy by design</h1>
+      <p>Perfect PDF AI stores account data, saved answers, uploaded documents, generated PDFs, and payment-credit records only to provide the service. Document and answer payloads are encrypted before database storage.</p>
+      <p>Documents are scoped to the account that uploaded them. Users can delete individual documents or delete their account and associated application data from the Account page.</p>
+      <p>Payment processing, when enabled, is handled by Stripe. Perfect PDF AI does not store full card numbers.</p>
+      <p class="muted">Production operators are responsible for configuring durable database storage, a stable encryption secret, and any legally required business contact or jurisdiction-specific notices before accepting customers.</p>
+    </section>
+    """
+    return HTMLResponse(page_shell("Privacy", body, request))
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page(request: Request) -> HTMLResponse:
+    body = """
+    <section class="card">
+      <p class="eyebrow">Terms</p>
+      <h1>Service terms</h1>
+      <p>Perfect PDF AI is a document-completion tool. Users are responsible for reviewing generated documents for accuracy before signing, submitting, or relying on them.</p>
+      <p>The service does not provide legal, tax, medical, financial, or government advice and does not guarantee that a generated form will be accepted by a third party.</p>
+      <p>Users must have the right to upload and process the documents and information they provide.</p>
+      <p class="muted">Before commercial launch, the operator should add the business identity, support contact, refund policy, governing-law terms, and any notices required for the markets served.</p>
+    </section>
+    """
+    return HTMLResponse(page_shell("Terms", body, request))
+
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request) -> HTMLResponse:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    csrf = html.escape(csrf_for_request(request))
+    with db_session() as session:
+        fresh = session.get(User, user.id)
+        credits = fresh.credits if fresh else 0
+        document_count = len(
+            session.scalars(
+                select(DocumentRecord.id).where(DocumentRecord.user_id == user.id)
+            ).all()
+        )
+    body = f"""
+    <section class="card">
+      <p class="eyebrow">Account</p>
+      <h1>Your data</h1>
+      <p><strong>{html.escape(user.email)}</strong></p>
+      <p>{document_count} saved document{"s" if document_count != 1 else ""} · {credits} completion credit{"s" if credits != 1 else ""}</p>
+      <p class="muted">Storage: {html.escape(STORAGE_BACKEND)}{" · durable" if DURABLE_STORAGE else " · non-durable/demo storage"}</p>
+    </section>
+    <section class="card">
+      <h2>Delete account</h2>
+      <p>This permanently deletes this account's saved documents, generated PDFs, reusable answers, sessions, and payment-credit records from Perfect PDF AI's application database.</p>
+      <form method="post" action="/account/delete" class="upload-form">
+        <input type="hidden" name="csrf" value="{csrf}">
+        <label>Confirm your password
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="danger" type="submit">Delete my account and data</button>
+      </form>
+    </section>
+    """
+    return HTMLResponse(page_shell("Account", body, request))
+
+
+@app.post("/account/delete")
+def delete_account(
+    request: Request,
+    csrf: str = Form(...),
+    password: str = Form(...),
+) -> Response:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    validate_csrf(request, csrf)
+
+    with db_session() as session:
+        fresh = session.get(User, user.id)
+        if fresh is None or not verify_password(password, fresh.password_hash):
+            return HTMLResponse(
+                page_shell(
+                    "Account",
+                    '<section class="card narrow"><h1>Password incorrect</h1><p>The account was not deleted.</p><a class="button" href="/account">Back</a></section>',
+                    request,
+                ),
+                status_code=403,
+            )
+
+        session.execute(delete(PaymentRecord).where(PaymentRecord.user_id == user.id))
+        session.execute(delete(DocumentRecord).where(DocumentRecord.user_id == user.id))
+        session.execute(delete(AnswerProfile).where(AnswerProfile.user_id == user.id))
+        session.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
+        session.execute(delete(User).where(User.id == user.id))
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -1381,6 +1487,10 @@ def document_detail(request: Request, document_id: str) -> HTMLResponse:
         <span class="pill">{html.escape(record.status.title())}</span>
       </div>
       {complete_actions}
+      <form method="post" action="/documents/{record.id}/delete" class="delete-form">
+        <input type="hidden" name="csrf" value="{csrf}">
+        <button class="danger small" type="submit">Delete document</button>
+      </form>
     </section>
 
     <section class="card">
@@ -1481,6 +1591,28 @@ async def complete_document(request: Request, document_id: str) -> Response:
 
     save_profile(user.id, combined)
     return RedirectResponse(url=f"/documents/{record.id}", status_code=303)
+
+
+@app.post("/documents/{document_id}/delete")
+def delete_document(
+    request: Request,
+    document_id: str,
+    csrf: str = Form(...),
+) -> Response:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    validate_csrf(request, csrf)
+    with db_session() as session:
+        result = session.execute(
+            delete(DocumentRecord).where(
+                DocumentRecord.id == document_id,
+                DocumentRecord.user_id == user.id,
+            )
+        )
+        if result.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Document not found.")
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/documents/{document_id}/download")
