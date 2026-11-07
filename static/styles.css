@@ -223,6 +223,30 @@ button:disabled {
   margin: 0;
 }
 
+.delete-form {
+  margin-top: 18px;
+}
+
+.site-footer {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  padding: 18px 0 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.danger {
+  background: rgba(255, 123, 123, 0.14);
+  color: #ffd3d3;
+  border: 1px solid rgba(255, 123, 123, 0.55);
+  box-shadow: none;
+}
+
+.danger:hover {
+  background: rgba(255, 123, 123, 0.22);
+}
+
 .link-button {
   padding: 0;
   background: transparent;

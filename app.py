@@ -30,7 +30,7 @@ from docx import Document as DocxDocument
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, create_engine, select
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, create_engine, delete, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -63,6 +63,20 @@ STRIPE_REQUIRE_PAYMENT: bool = os.getenv("STRIPE_REQUIRE_PAYMENT", "false").stri
 }
 PAYMENT_CREDITS: Final[int] = max(1, int(os.getenv("PAYMENT_CREDITS", "1")))
 FREE_COMPLETIONS: Final[int] = max(0, int(os.getenv("FREE_COMPLETIONS", "1")))
+STRIPE_PAYMENT_LINK_ID: Final[str] = os.getenv("STRIPE_PAYMENT_LINK_ID", "").strip()
+
+OCR_ENABLED: Final[bool] = os.getenv("OCR_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+OCR_DPI: Final[int] = max(96, min(240, int(os.getenv("OCR_DPI", "144"))))
+OCR_MAX_PAGES: Final[int] = max(1, int(os.getenv("OCR_MAX_PAGES", "12")))
+OCR_MIN_TEXT_CHARS: Final[int] = max(0, int(os.getenv("OCR_MIN_TEXT_CHARS", "40")))
+OCR_MIN_CONFIDENCE: Final[float] = max(
+    0.0, min(1.0, float(os.getenv("OCR_MIN_CONFIDENCE", "0.55")))
+)
 
 ALLOWED_EXTENSIONS: Final[set[str]] = {".pdf", ".txt", ".md", ".csv", ".docx"}
 ANSWER_EXTENSIONS: Final[set[str]] = {".txt", ".md", ".csv", ".json"}
@@ -76,6 +90,9 @@ elif _raw_db_url.startswith("postgresql://"):
     DATABASE_URL = "postgresql+psycopg://" + _raw_db_url[len("postgresql://") :]
 else:
     DATABASE_URL = _raw_db_url
+
+STORAGE_BACKEND: Final[str] = "postgresql" if DATABASE_URL.startswith("postgresql") else "sqlite"
+DURABLE_STORAGE: Final[bool] = STORAGE_BACKEND == "postgresql"
 
 _engine_kwargs: dict = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite:"):
@@ -502,6 +519,72 @@ def is_question_candidate(text: str) -> bool:
     return False
 
 
+def _page_needs_ocr(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return len(compact) < OCR_MIN_TEXT_CHARS
+
+
+_ocr_engine = None
+
+
+def get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        from rapidocr import RapidOCR
+
+        _ocr_engine = RapidOCR(
+            params={
+                "Global.text_score": 0.35,
+                "Det.thresh": 0.20,
+                "Det.box_thresh": 0.30,
+            }
+        )
+    return _ocr_engine
+
+
+def _ocr_page_lines_at_dpi(page, dpi: int) -> list[dict]:
+    scale = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    result = get_ocr_engine()(pix.tobytes("png"))
+    boxes = getattr(result, "boxes", None)
+    texts = getattr(result, "txts", None) or ()
+    scores = getattr(result, "scores", None) or ()
+    if boxes is None:
+        return []
+
+    lines: list[dict] = []
+    for box, text, score in zip(boxes, texts, scores):
+        text_clean = " ".join(str(text).split()).strip()
+        score_value = float(score or 0.0)
+        if not text_clean or score_value < OCR_MIN_CONFIDENCE:
+            continue
+        points = list(box)
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        lines.append(
+            {
+                "text": text_clean,
+                "score": score_value,
+                "rect": [
+                    min(xs) / scale,
+                    min(ys) / scale,
+                    max(xs) / scale,
+                    max(ys) / scale,
+                ],
+            }
+        )
+    return lines
+
+
+def ocr_page_lines(page) -> list[dict]:
+    retry_dpi = min(240, max(OCR_DPI + 72, int(OCR_DPI * 1.5)))
+    for dpi in dict.fromkeys((OCR_DPI, retry_dpi)):
+        lines = _ocr_page_lines_at_dpi(page, dpi)
+        if lines:
+            return lines
+    return []
+
+
 def extract_pdf_analysis(data: bytes) -> dict:
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -511,10 +594,33 @@ def extract_pdf_analysis(data: bytes) -> dict:
     fields: list[dict] = []
     full_text_parts: list[str] = []
     seen: set[tuple[int, str, str]] = set()
+    ocr_pages: list[int] = []
+    ocr_error: Optional[str] = None
 
     for page_index, page in enumerate(doc):
         page_text = page.get_text("text") or ""
-        full_text_parts.append(f"--- Page {page_index + 1} ---\n{page_text}".strip())
+        page_text_for_analysis = page_text
+        ocr_lines: list[dict] = []
+
+        if (
+            OCR_ENABLED
+            and page_index < OCR_MAX_PAGES
+            and _page_needs_ocr(page_text)
+        ):
+            try:
+                ocr_lines = ocr_page_lines(page)
+                if ocr_lines:
+                    ocr_pages.append(page_index + 1)
+                    page_text_for_analysis = "\n".join(
+                        line["text"] for line in ocr_lines
+                    )
+            except Exception as exc:
+                if ocr_error is None:
+                    ocr_error = f"{type(exc).__name__}: {exc}"[:240]
+
+        full_text_parts.append(
+            f"--- Page {page_index + 1} ---\n{page_text_for_analysis}".strip()
+        )
 
         widgets = list(page.widgets() or [])
         for widget in widgets:
@@ -536,6 +642,34 @@ def extract_pdf_analysis(data: bytes) -> dict:
                     "widget_name": widget.field_name or label,
                 }
             )
+
+        if ocr_lines:
+            for line in ocr_lines:
+                text = str(line["text"]).strip()
+                if not is_question_candidate(text):
+                    continue
+                normalized = normalize_label(text)
+                if any(
+                    normalize_label(existing["label"]) == normalized
+                    and existing["page"] == page_index
+                    for existing in fields
+                ):
+                    continue
+                key = (page_index, normalized, "ocr_text")
+                if key in seen:
+                    continue
+                seen.add(key)
+                fields.append(
+                    {
+                        "id": f"f{len(fields)+1}",
+                        "label": text,
+                        "kind": "ocr_text",
+                        "page": page_index,
+                        "rect": [float(v) for v in line["rect"]],
+                        "ocr_confidence": round(float(line["score"]), 4),
+                    }
+                )
+            continue
 
         page_dict = page.get_text("dict")
         for block in page_dict.get("blocks", []):
@@ -577,8 +711,10 @@ def extract_pdf_analysis(data: bytes) -> dict:
         "page_count": page_count,
         "fields": fields,
         "text": "\n\n".join(full_text_parts).strip(),
+        "ocr_used": bool(ocr_pages),
+        "ocr_pages": ocr_pages,
+        "ocr_error": ocr_error,
     }
-
 
 def extract_docx_text(data: bytes) -> str:
     try:
@@ -768,12 +904,16 @@ def get_document_for_user(document_id: str, user_id: int) -> DocumentRecord:
 
 
 def payment_configured() -> bool:
-    return bool(STRIPE_PAYMENT_LINK and STRIPE_WEBHOOK_SECRET)
+    return bool(
+        STRIPE_PAYMENT_LINK
+        and STRIPE_WEBHOOK_SECRET
+        and STRIPE_PAYMENT_LINK_ID
+    )
 
 
 def checkout_url_for_user(user: User) -> str:
-    if not STRIPE_PAYMENT_LINK:
-        raise HTTPException(status_code=503, detail="Stripe checkout is not configured.")
+    if not payment_configured():
+        raise HTTPException(status_code=503, detail="Stripe checkout is not fully configured.")
     parts = urlsplit(STRIPE_PAYMENT_LINK)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["client_reference_id"] = str(user.id)
@@ -815,6 +955,7 @@ def page_shell(title: str, body: str, request: Optional[Request] = None) -> str:
           <a class="brand" href="/">{html.escape(APP_NAME)}</a>
           <div class="topbar-right">
             <span class="muted">{html.escape(user.email)}</span>
+            <a href="/account">Account</a>
             <form method="post" action="/logout" class="inline-form">
               <input type="hidden" name="csrf" value="{csrf}">
               <button class="link-button" type="submit">Logout</button>
@@ -843,6 +984,10 @@ def page_shell(title: str, body: str, request: Optional[Request] = None) -> str:
   <main class="wrap">
     {nav}
     {body}
+    <footer class="site-footer">
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+    </footer>
   </main>
   <script src="/static/app.js"></script>
 </body>
@@ -865,7 +1010,7 @@ def login_required_page(request: Request) -> HTMLResponse:
 
 
 def payment_required_page(request: Request, user: User) -> HTMLResponse:
-    if STRIPE_PAYMENT_LINK:
+    if payment_configured():
         action = '<a class="button" href="/checkout">Buy a completion credit</a>'
     else:
         action = '<p class="warning">Payments are not configured yet. The owner must connect Stripe before paid completions can be sold.</p>'
@@ -881,7 +1026,7 @@ def payment_required_page(request: Request, user: User) -> HTMLResponse:
     return HTMLResponse(page_shell("Payment Required", body, request), status_code=402)
 
 
-app = FastAPI(title=APP_NAME, version="2.0.0")
+app = FastAPI(title=APP_NAME, version="2.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -907,14 +1052,21 @@ def health() -> JSONResponse:
     except Exception:
         database_ok = False
     status = 200 if database_ok else 503
+    secure_ready = SECURE_CONFIGURATION if ENVIRONMENT == "production" else True
+    payments_ready = payment_configured() if STRIPE_REQUIRE_PAYMENT else True
+    launch_ready = bool(database_ok and secure_ready and DURABLE_STORAGE and payments_ready)
     return JSONResponse(
         {
             "ok": database_ok,
             "service": "perfect-pdf-ai",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "database": database_ok,
-            "secure_configuration": SECURE_CONFIGURATION if ENVIRONMENT == "production" else True,
+            "storage_backend": STORAGE_BACKEND,
+            "durable_storage": DURABLE_STORAGE,
+            "secure_configuration": secure_ready,
             "payments_configured": payment_configured(),
+            "ocr_enabled": OCR_ENABLED,
+            "launch_ready": launch_ready,
         },
         status_code=status,
     )
@@ -932,6 +1084,11 @@ def config() -> JSONResponse:
             "payment_configured": payment_configured(),
             "payment_credits": PAYMENT_CREDITS,
             "free_completions": FREE_COMPLETIONS,
+            "storage_backend": STORAGE_BACKEND,
+            "durable_storage": DURABLE_STORAGE,
+            "ocr_enabled": OCR_ENABLED,
+            "ocr_dpi": OCR_DPI,
+            "ocr_max_pages": OCR_MAX_PAGES,
         }
     )
 
@@ -972,7 +1129,7 @@ def home(request: Request) -> HTMLResponse:
     payment_html = ""
     if STRIPE_REQUIRE_PAYMENT:
         payment_html = f'<span class="pill">{credits} completion credit{"s" if credits != 1 else ""}</span>'
-        if credits <= 0 and STRIPE_PAYMENT_LINK:
+        if credits <= 0 and payment_configured():
             payment_html += ' <a class="button small" href="/checkout">Buy credit</a>'
 
     history_cards = []
@@ -1033,6 +1190,107 @@ def home(request: Request) -> HTMLResponse:
     </section>
     """
     return HTMLResponse(page_shell(APP_NAME, body, request))
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page(request: Request) -> HTMLResponse:
+    body = """
+    <section class="card">
+      <p class="eyebrow">Privacy</p>
+      <h1>Privacy by design</h1>
+      <p>Perfect PDF AI stores account data, saved answers, uploaded documents, generated PDFs, and payment-credit records only to provide the service. Document and answer payloads are encrypted before database storage.</p>
+      <p>Documents are scoped to the account that uploaded them. Users can delete individual documents or delete their account and associated application data from the Account page.</p>
+      <p>Payment processing, when enabled, is handled by Stripe. Perfect PDF AI does not store full card numbers.</p>
+      <p class="muted">Production operators are responsible for configuring durable database storage, a stable encryption secret, and any legally required business contact or jurisdiction-specific notices before accepting customers.</p>
+    </section>
+    """
+    return HTMLResponse(page_shell("Privacy", body, request))
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page(request: Request) -> HTMLResponse:
+    body = """
+    <section class="card">
+      <p class="eyebrow">Terms</p>
+      <h1>Service terms</h1>
+      <p>Perfect PDF AI is a document-completion tool. Users are responsible for reviewing generated documents for accuracy before signing, submitting, or relying on them.</p>
+      <p>The service does not provide legal, tax, medical, financial, or government advice and does not guarantee that a generated form will be accepted by a third party.</p>
+      <p>Users must have the right to upload and process the documents and information they provide.</p>
+      <p class="muted">Before commercial launch, the operator should add the business identity, support contact, refund policy, governing-law terms, and any notices required for the markets served.</p>
+    </section>
+    """
+    return HTMLResponse(page_shell("Terms", body, request))
+
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request) -> HTMLResponse:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    csrf = html.escape(csrf_for_request(request))
+    with db_session() as session:
+        fresh = session.get(User, user.id)
+        credits = fresh.credits if fresh else 0
+        document_count = len(
+            session.scalars(
+                select(DocumentRecord.id).where(DocumentRecord.user_id == user.id)
+            ).all()
+        )
+    body = f"""
+    <section class="card">
+      <p class="eyebrow">Account</p>
+      <h1>Your data</h1>
+      <p><strong>{html.escape(user.email)}</strong></p>
+      <p>{document_count} saved document{"s" if document_count != 1 else ""} · {credits} completion credit{"s" if credits != 1 else ""}</p>
+      <p class="muted">Storage: {html.escape(STORAGE_BACKEND)}{" · durable" if DURABLE_STORAGE else " · non-durable/demo storage"}</p>
+    </section>
+    <section class="card">
+      <h2>Delete account</h2>
+      <p>This permanently deletes this account's saved documents, generated PDFs, reusable answers, sessions, and payment-credit records from Perfect PDF AI's application database.</p>
+      <form method="post" action="/account/delete" class="upload-form">
+        <input type="hidden" name="csrf" value="{csrf}">
+        <label>Confirm your password
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="danger" type="submit">Delete my account and data</button>
+      </form>
+    </section>
+    """
+    return HTMLResponse(page_shell("Account", body, request))
+
+
+@app.post("/account/delete")
+def delete_account(
+    request: Request,
+    csrf: str = Form(...),
+    password: str = Form(...),
+) -> Response:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    validate_csrf(request, csrf)
+
+    with db_session() as session:
+        fresh = session.get(User, user.id)
+        if fresh is None or not verify_password(password, fresh.password_hash):
+            return HTMLResponse(
+                page_shell(
+                    "Account",
+                    '<section class="card narrow"><h1>Password incorrect</h1><p>The account was not deleted.</p><a class="button" href="/account">Back</a></section>',
+                    request,
+                ),
+                status_code=403,
+            )
+
+        session.execute(delete(PaymentRecord).where(PaymentRecord.user_id == user.id))
+        session.execute(delete(DocumentRecord).where(DocumentRecord.user_id == user.id))
+        session.execute(delete(AnswerProfile).where(AnswerProfile.user_id == user.id))
+        session.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
+        session.execute(delete(User).where(User.id == user.id))
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -1220,7 +1478,7 @@ def document_detail(request: Request, document_id: str) -> HTMLResponse:
 
     pay_notice = ""
     if STRIPE_REQUIRE_PAYMENT and credits <= 0:
-        if STRIPE_PAYMENT_LINK:
+        if payment_configured():
             pay_notice = '<div class="notice"><strong>Payment required to generate.</strong> <a href="/checkout">Buy a completion credit</a>. You can still review the detected fields first.</div>'
         else:
             pay_notice = '<div class="notice warning"><strong>Paid mode is enabled but Stripe is not configured.</strong></div>'
@@ -1240,10 +1498,14 @@ def document_detail(request: Request, document_id: str) -> HTMLResponse:
     <section class="card">
       <p class="eyebrow">Analyzed document</p>
       <div class="section-heading">
-        <div><h1>{html.escape(record.filename)}</h1><p>{len(fields)} detected field/question{"s" if len(fields) != 1 else ""} · {int(analysis.get("page_count", 1))} page{"s" if int(analysis.get("page_count", 1)) != 1 else ""}</p></div>
+        <div><h1>{html.escape(record.filename)}</h1><p>{len(fields)} detected field/question{"s" if len(fields) != 1 else ""} · {int(analysis.get("page_count", 1))} page{"s" if int(analysis.get("page_count", 1)) != 1 else ""}{" · OCR used on " + ", ".join(str(p) for p in analysis.get("ocr_pages", [])) if analysis.get("ocr_used") else ""}</p></div>
         <span class="pill">{html.escape(record.status.title())}</span>
       </div>
       {complete_actions}
+      <form method="post" action="/documents/{record.id}/delete" class="delete-form">
+        <input type="hidden" name="csrf" value="{csrf}">
+        <button class="danger small" type="submit">Delete document</button>
+      </form>
     </section>
 
     <section class="card">
@@ -1334,13 +1596,38 @@ async def complete_document(request: Request, document_id: str) -> Response:
         db_record.updated_at = utcnow()
 
         if STRIPE_REQUIRE_PAYMENT:
-            db_user = session.get(User, user.id)
-            if db_user is None or db_user.credits <= 0:
+            credit_update = session.execute(
+                update(User)
+                .where(User.id == user.id, User.credits > 0)
+                .values(credits=User.credits - 1)
+            )
+            if credit_update.rowcount != 1:
                 raise HTTPException(status_code=402, detail="A completion credit is required.")
-            db_user.credits -= 1
 
     save_profile(user.id, combined)
     return RedirectResponse(url=f"/documents/{record.id}", status_code=303)
+
+
+@app.post("/documents/{document_id}/delete")
+def delete_document(
+    request: Request,
+    document_id: str,
+    csrf: str = Form(...),
+) -> Response:
+    user = current_user(request)
+    if user is None:
+        return login_required_page(request)
+    validate_csrf(request, csrf)
+    with db_session() as session:
+        result = session.execute(
+            delete(DocumentRecord).where(
+                DocumentRecord.id == document_id,
+                DocumentRecord.user_id == user.id,
+            )
+        )
+        if result.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Document not found.")
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/documents/{document_id}/download")
@@ -1468,7 +1755,7 @@ def payment_success(request: Request) -> HTMLResponse:
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request) -> JSONResponse:
-    if not STRIPE_WEBHOOK_SECRET:
+    if not STRIPE_WEBHOOK_SECRET or not STRIPE_PAYMENT_LINK_ID:
         return JSONResponse({"ok": False, "error": "webhook_not_configured"}, status_code=503)
     payload = await request.body()
     signature = request.headers.get("stripe-signature", "")
@@ -1477,11 +1764,22 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid_signature"}, status_code=400)
 
-    if event.get("type") == "checkout.session.completed":
+    if event.get("type") in {
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+    }:
         session_object = event.get("data", {}).get("object", {})
         stripe_session_id = str(session_object.get("id", "")).strip()
         reference = str(session_object.get("client_reference_id", "")).strip()
-        if stripe_session_id and reference.isdigit():
+        payment_link_id = str(session_object.get("payment_link", "")).strip()
+        payment_status = str(session_object.get("payment_status", "")).strip().lower()
+
+        if (
+            stripe_session_id
+            and reference.isdigit()
+            and payment_link_id == STRIPE_PAYMENT_LINK_ID
+            and payment_status == "paid"
+        ):
             user_id = int(reference)
             with db_session() as dbs:
                 existing = dbs.get(PaymentRecord, stripe_session_id)

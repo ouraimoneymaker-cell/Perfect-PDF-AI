@@ -5,7 +5,7 @@ Perfect PDF AI is a FastAPI web app that turns uploaded forms into completed PDF
 ## Product flow
 
 1. A user creates an account and uploads a PDF, DOCX, TXT, MD, or CSV form.
-2. The local document-intelligence engine detects fillable PDF widgets and printed field/question labels.
+2. The local document-intelligence engine detects fillable PDF widgets, printed field/question labels, and image-only scanned pages through local OCR.
 3. Saved answers are semantically matched to the new form so the user does not have to retype the same information.
 4. The user confirms or corrects the proposed answers.
 5. Perfect PDF AI fills true PDF form fields where possible, overlays answers beside printed labels, and appends a completion summary.
@@ -34,6 +34,7 @@ The app uses SQLAlchemy.
 - If DATABASE_URL is set to PostgreSQL, Postgres is used.
 - Without it, local development uses SQLite at data/perfect_pdf_ai.sqlite3.
 - Uploaded documents are stored as encrypted database blobs, so production does not depend on Render's ephemeral filesystem.
+- Production history is only durable when `DATABASE_URL` points to durable PostgreSQL. Render Free Postgres expires after 30 days, so it is not treated as permanent production storage.
 
 ## Local run
 
@@ -55,7 +56,7 @@ GitHub Actions also compiles app.py before running the suite.
 
 ## Render
 
-render.yaml defines a free Python web service plus free Render Postgres:
+render.yaml defines the free Python web service and requires `DATABASE_URL` to be supplied from a durable PostgreSQL provider:
 
 \`\`\`yaml
 startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
@@ -68,7 +69,7 @@ The production service should run with:
 ENVIRONMENT=production
 COOKIE_SECURE=true
 APP_SECRET_KEY=<stable secret>
-DATABASE_URL=<Render Postgres internal connection string>
+DATABASE_URL=<durable PostgreSQL connection string>
 \`\`\`
 
 ## Stripe monetization
@@ -80,6 +81,7 @@ Required production variables:
 \`\`\`text
 STRIPE_REQUIRE_PAYMENT=true
 STRIPE_PAYMENT_LINK=https://buy.stripe.com/...
+STRIPE_PAYMENT_LINK_ID=plink_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 PAYMENT_CREDITS=1
 FREE_COMPLETIONS=1
@@ -95,10 +97,10 @@ Configure a Stripe webhook for:
 
 \`\`\`text
 POST https://YOUR-DOMAIN/stripe/webhook
-event: checkout.session.completed
+events: checkout.session.completed, checkout.session.async_payment_succeeded
 \`\`\`
 
-Only a webhook event with a valid Stripe signature grants credits. Repeated delivery of the same Stripe Checkout Session is idempotent.
+Only a webhook event with a valid Stripe signature, the configured Payment Link ID, and `payment_status=paid` grants credits. Repeated delivery of the same Stripe Checkout Session is idempotent.
 
 Keep STRIPE_REQUIRE_PAYMENT=false until the Payment Link and webhook secret are configured.
 
@@ -128,4 +130,4 @@ POST /stripe/webhook
 
 ## Current implementation boundary
 
-The built-in intelligence is a local semantic/fuzzy mapping engine designed for common application labels and PDF fields. It does not call an external LLM and therefore has no per-document AI API cost. Complex handwriting, scanned-image OCR, and forms whose questions are only present as images are outside the current zero-cost processing path.
+The built-in intelligence is a local semantic/fuzzy mapping engine plus RapidOCR for image-only scanned pages. It does not call an external LLM and therefore has no per-document AI API cost. Handwriting and unusually complex layouts can still require manual correction, which is why detected answers are always presented for confirmation before generation.
