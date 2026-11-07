@@ -532,12 +532,18 @@ def get_ocr_engine():
     if _ocr_engine is None:
         from rapidocr import RapidOCR
 
-        _ocr_engine = RapidOCR()
+        _ocr_engine = RapidOCR(
+            params={
+                "Global.text_score": 0.35,
+                "Det.thresh": 0.20,
+                "Det.box_thresh": 0.30,
+            }
+        )
     return _ocr_engine
 
 
-def ocr_page_lines(page) -> list[dict]:
-    scale = OCR_DPI / 72.0
+def _ocr_page_lines_at_dpi(page, dpi: int) -> list[dict]:
+    scale = dpi / 72.0
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
     result = get_ocr_engine()(pix.tobytes("png"))
     boxes = getattr(result, "boxes", None)
@@ -568,6 +574,15 @@ def ocr_page_lines(page) -> list[dict]:
             }
         )
     return lines
+
+
+def ocr_page_lines(page) -> list[dict]:
+    retry_dpi = min(240, max(OCR_DPI + 72, int(OCR_DPI * 1.5)))
+    for dpi in dict.fromkeys((OCR_DPI, retry_dpi)):
+        lines = _ocr_page_lines_at_dpi(page, dpi)
+        if lines:
+            return lines
+    return []
 
 
 def extract_pdf_analysis(data: bytes) -> dict:
