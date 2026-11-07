@@ -33,6 +33,14 @@ services:
         value: "40"
       - key: OCR_MIN_CONFIDENCE
         value: "0.55"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: DATABASE_URL
         sync: false
       - key: APP_SECRET_KEY
