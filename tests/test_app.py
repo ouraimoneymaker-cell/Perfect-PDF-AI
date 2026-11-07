@@ -45,8 +45,10 @@ from app import (
 def reset_database(monkeypatch):
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
+    app_module._rate_limit_buckets.clear()
     monkeypatch.setattr(app_module, "STRIPE_REQUIRE_PAYMENT", False)
     yield
+    app_module._rate_limit_buckets.clear()
 
 
 @pytest.fixture
@@ -130,12 +132,14 @@ def test_health_and_config(client):
     assert payload["ocr_enabled"] is True
     assert payload["ocr_engine"] == "tesseract"
     assert payload["ocr_available"] is True
+    assert "durable_storage" in payload["readiness_issues"]
     assert payload["launch_ready"] is False
 
     config = client.get("/config")
     assert config.status_code == 200
     assert ".pdf" in config.json()["allowed_extensions"]
     assert config.json()["ocr_enabled"] is True
+    assert config.json()["ocr_total_timeout_seconds"] >= config.json()["ocr_timeout_seconds"]
 
 
 def test_registration_login_and_secure_session_hash(client):
@@ -157,6 +161,101 @@ def test_registration_login_and_secure_session_hash(client):
         follow_redirects=False,
     )
     assert login.status_code == 303
+
+
+
+def test_production_fails_closed_without_secure_durable_storage(client, monkeypatch):
+    monkeypatch.setattr(app_module, "ENVIRONMENT", "production")
+    monkeypatch.setattr(app_module, "SECURE_CONFIGURATION", False)
+    monkeypatch.setattr(app_module, "DURABLE_STORAGE", False)
+
+    home = client.get("/")
+    assert home.status_code == 503
+    assert "Uploads are temporarily disabled" in home.text
+
+    api = client.post(
+        "/api/upload",
+        files={"file": ("test.pdf", sample_pdf(), "application/pdf")},
+    )
+    assert api.status_code == 503
+    assert api.json()["error"] == "service_not_ready"
+
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["launch_ready"] is False
+    assert "secure_configuration" in health.json()["readiness_issues"]
+    assert "durable_storage" in health.json()["readiness_issues"]
+
+    assert client.get("/privacy").status_code == 200
+    assert client.get("/terms").status_code == 200
+
+
+def test_production_serves_normally_when_required_configuration_is_ready(client, monkeypatch):
+    monkeypatch.setattr(app_module, "ENVIRONMENT", "production")
+    monkeypatch.setattr(app_module, "SECURE_CONFIGURATION", True)
+    monkeypatch.setattr(app_module, "DURABLE_STORAGE", True)
+    monkeypatch.setattr(app_module, "OCR_ENABLED", False)
+
+    home = client.get("/")
+    assert home.status_code == 200
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["readiness_issues"] == []
+    assert health.json()["launch_ready"] is True
+
+
+def test_login_failures_are_rate_limited(client, monkeypatch):
+    register(client)
+    logout = client.post("/logout", data={"csrf": csrf(client)}, follow_redirects=False)
+    assert logout.status_code == 303
+
+    monkeypatch.setattr(app_module, "LOGIN_RATE_LIMIT", 2)
+    monkeypatch.setattr(app_module, "LOGIN_RATE_WINDOW_SECONDS", 600)
+
+    for _ in range(2):
+        failed = client.post(
+            "/login",
+            data={"email": "user@example.com", "password": "wrong-password"},
+            follow_redirects=False,
+        )
+        assert failed.status_code == 401
+
+    blocked = client.post(
+        "/login",
+        data={"email": "user@example.com", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) > 0
+
+    app_module._rate_limit_buckets.clear()
+    success = client.post(
+        "/login",
+        data={"email": "user@example.com", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert success.status_code == 303
+
+
+def test_analysis_requests_are_rate_limited_per_user(client, monkeypatch):
+    register(client)
+    monkeypatch.setattr(app_module, "ANALYZE_RATE_LIMIT", 1)
+    monkeypatch.setattr(app_module, "ANALYZE_RATE_WINDOW_SECONDS", 600)
+
+    first = client.post(
+        "/api/upload",
+        files={"file": ("one.pdf", sample_pdf(), "application/pdf")},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/upload",
+        files={"file": ("two.pdf", sample_pdf(), "application/pdf")},
+    )
+    assert second.status_code == 429
+    assert second.json()["error"] == "rate_limited"
+    assert int(second.headers["retry-after"]) > 0
+
 
 
 def test_smart_mapping_matches_semantic_labels():
@@ -211,6 +310,27 @@ def test_scanned_pdf_uses_ocr_coordinates(monkeypatch):
     assert analysis["fields"][0]["label"] == "Full Name:"
     assert analysis["fields"][0]["rect"] == [72.0, 130.0, 145.0, 143.0]
     assert "Full Name:" in analysis["text"]
+
+
+
+
+def test_ocr_document_budget_stops_additional_ocr_work(monkeypatch):
+    monkeypatch.setattr(app_module, "OCR_TOTAL_TIMEOUT_SECONDS", 1)
+    ticks = iter([0.0, 2.0])
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: next(ticks))
+
+    called = {"ocr": False}
+
+    def should_not_run(page):
+        called["ocr"] = True
+        raise AssertionError("OCR should not run after the total time budget is exhausted.")
+
+    monkeypatch.setattr(app_module, "ocr_page_lines", should_not_run)
+    analysis = app_module.extract_pdf_analysis(scanned_pdf())
+
+    assert called["ocr"] is False
+    assert analysis["ocr_used"] is False
+    assert "time budget" in analysis["ocr_error"].lower()
 
 
 

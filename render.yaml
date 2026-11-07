@@ -37,7 +37,17 @@ services:
       - key: OCR_PSM
         value: "11"
       - key: OCR_TIMEOUT_SECONDS
-        value: "45"
+        value: "20"
+      - key: OCR_TOTAL_TIMEOUT_SECONDS
+        value: "90"
+      - key: LOGIN_RATE_LIMIT
+        value: "8"
+      - key: LOGIN_RATE_WINDOW_SECONDS
+        value: "900"
+      - key: ANALYZE_RATE_LIMIT
+        value: "30"
+      - key: ANALYZE_RATE_WINDOW_SECONDS
+        value: "3600"
       - key: DATABASE_URL
         sync: false
       - key: APP_SECRET_KEY

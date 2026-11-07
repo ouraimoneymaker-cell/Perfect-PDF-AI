@@ -24,6 +24,8 @@ The core form-mapping engine runs locally in the application and does not requir
 - Every document query is scoped to its owning user.
 - File size, extension, and basic PDF/DOCX signature validation are enforced.
 - Security headers are applied to every response.
+- Failed logins are throttled by account identifier and document-analysis requests are throttled per authenticated user.
+- Production fails closed: customer routes return HTTP 503 until secure encryption configuration, durable PostgreSQL, OCR runtime, and any required payment configuration are ready.
 
 APP_SECRET_KEY must remain stable. Changing it makes previously encrypted documents unreadable.
 
@@ -80,6 +82,8 @@ DATABASE_URL=<durable PostgreSQL connection string>
 OCR_ENABLED=true
 OCR_LANGUAGE=eng
 OCR_PSM=11
+OCR_TIMEOUT_SECONDS=20
+OCR_TOTAL_TIMEOUT_SECONDS=90
 \`\`\`
 
 ## Stripe monetization
@@ -140,4 +144,4 @@ POST /stripe/webhook
 
 ## Current implementation boundary
 
-The built-in intelligence is a local semantic/fuzzy mapping engine plus Tesseract OCR for image-only scanned pages. It does not call an external LLM and therefore has no per-document AI API cost. Handwriting and unusually complex layouts can still require manual correction, which is why detected answers are always presented for confirmation before generation.
+The built-in intelligence is a local semantic/fuzzy mapping engine plus Tesseract OCR for image-only scanned pages. It does not call an external LLM and therefore has no per-document AI API cost. Handwriting and unusually complex layouts can still require manual correction, which is why detected answers are always presented for confirmation before generation. OCR work is bounded by per-page and per-document time budgets so a pathological scan cannot monopolize the web worker.
