@@ -1,11 +1,10 @@
 services:
   - type: web
     name: perfect-pdf-ai
-    runtime: python
+    runtime: docker
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeployTrigger: checksPass
     envVars:
@@ -33,14 +32,12 @@ services:
         value: "40"
       - key: OCR_MIN_CONFIDENCE
         value: "0.55"
-      - key: OMP_NUM_THREADS
-        value: "1"
-      - key: OPENBLAS_NUM_THREADS
-        value: "1"
-      - key: MKL_NUM_THREADS
-        value: "1"
-      - key: MALLOC_ARENA_MAX
-        value: "2"
+      - key: OCR_LANGUAGE
+        value: eng
+      - key: OCR_PSM
+        value: "11"
+      - key: OCR_TIMEOUT_SECONDS
+        value: "45"
       - key: DATABASE_URL
         sync: false
       - key: APP_SECRET_KEY

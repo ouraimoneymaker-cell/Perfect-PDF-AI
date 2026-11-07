@@ -28,6 +28,11 @@ jobs:
         with:
           python-version: "3.12.16"
 
+      - name: Install Tesseract
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -35,7 +40,7 @@ jobs:
         run: python -m py_compile app.py
 
       - name: Verify OCR runtime
-        run: python -c "import onnxruntime, rapidocr; print(onnxruntime.__version__)"
+        run: tesseract --version
 
       - name: Run tests
         run: python -m pytest -q
@@ -44,3 +49,21 @@ jobs:
         run: |
           python -m pip install pip-audit==2.10.1
           python -m pip_audit -r requirements.txt --progress-spinner off
+
+      - name: Build production Docker image
+        run: docker build -t perfect-pdf-ai:test .
+
+      - name: Test production Docker image
+        run: |
+          docker run --rm \
+            -e ENVIRONMENT=test \
+            -e COOKIE_SECURE=false \
+            -e APP_SECRET_KEY=test-secret-key-that-is-long-enough-for-tests-123456789 \
+            -e DATABASE_URL=sqlite:////tmp/perfect_pdf_ai_docker_ci.sqlite3 \
+            -e STRIPE_REQUIRE_PAYMENT=false \
+            -e STRIPE_PAYMENT_LINK=https://buy.stripe.com/test_perfect_pdf_ai \
+            -e STRIPE_WEBHOOK_SECRET=whsec_perfect_pdf_ai_test \
+            -e STRIPE_PAYMENT_LINK_ID=plink_test_perfect_pdf_ai \
+            -e OCR_ENABLED=true \
+            perfect-pdf-ai:test \
+            python -m pytest -q

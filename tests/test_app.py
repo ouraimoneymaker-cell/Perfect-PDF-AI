@@ -128,6 +128,8 @@ def test_health_and_config(client):
     assert payload["storage_backend"] == "sqlite"
     assert payload["durable_storage"] is False
     assert payload["ocr_enabled"] is True
+    assert payload["ocr_engine"] == "tesseract"
+    assert payload["ocr_available"] is True
     assert payload["launch_ready"] is False
 
     config = client.get("/config")
@@ -175,11 +177,19 @@ def test_smart_mapping_matches_semantic_labels():
 
 
 def test_ocr_runtime_dependencies_import():
-    import onnxruntime
-    import rapidocr
+    import shutil
+    import subprocess
 
-    assert onnxruntime.__version__
-    assert rapidocr is not None
+    executable = shutil.which("tesseract")
+    assert executable
+    result = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "tesseract" in result.stdout.lower()
 
 
 def test_scanned_pdf_uses_ocr_coordinates(monkeypatch):
