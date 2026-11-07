@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, "launch/**"]
+    branches: [main, "launch/**", "build/**"]
   pull_request:
     branches: [main]
 
@@ -16,7 +16,7 @@ jobs:
       DATABASE_URL: sqlite:////tmp/perfect_pdf_ai_ci.sqlite3
       STRIPE_REQUIRE_PAYMENT: "false"
       STRIPE_PAYMENT_LINK: https://buy.stripe.com/test_perfect_pdf_ai
-      STRIPE_WEBHOOK_SECRET: whsec_perfect_pdf_ai_test
+      STRIPE_WEBHOOK_SECRET: whsec_perfect_pdf_ai_test\n      STRIPE_PAYMENT_LINK_ID: plink_test_perfect_pdf_ai\n      OCR_ENABLED: "true"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
