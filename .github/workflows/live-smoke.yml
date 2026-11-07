@@ -9,7 +9,7 @@ jobs:
   live-smoke:
     runs-on: ubuntu-latest
     env:
-      SMOKE_BASE_URL: https://perfect-pdf-ai-v21-staging.onrender.com
+      SMOKE_BASE_URL: https://perfect-pdf-ai-tesseract-staging.onrender.com
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
