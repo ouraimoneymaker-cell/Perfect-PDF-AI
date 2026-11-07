@@ -19,11 +19,13 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+from threading import Lock
 from typing import Final, Iterable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -83,8 +85,21 @@ OCR_MIN_CONFIDENCE: Final[float] = max(
 )
 OCR_LANGUAGE: Final[str] = os.getenv("OCR_LANGUAGE", "eng").strip() or "eng"
 OCR_PSM: Final[int] = max(3, min(13, int(os.getenv("OCR_PSM", "11"))))
-OCR_TIMEOUT_SECONDS: Final[int] = max(5, int(os.getenv("OCR_TIMEOUT_SECONDS", "45")))
+OCR_TIMEOUT_SECONDS: Final[int] = max(5, int(os.getenv("OCR_TIMEOUT_SECONDS", "20")))
+OCR_TOTAL_TIMEOUT_SECONDS: Final[int] = max(
+    OCR_TIMEOUT_SECONDS,
+    int(os.getenv("OCR_TOTAL_TIMEOUT_SECONDS", "90")),
+)
 OCR_ENGINE: Final[str] = "tesseract"
+
+LOGIN_RATE_LIMIT: Final[int] = max(1, int(os.getenv("LOGIN_RATE_LIMIT", "8")))
+LOGIN_RATE_WINDOW_SECONDS: Final[int] = max(
+    60, int(os.getenv("LOGIN_RATE_WINDOW_SECONDS", "900"))
+)
+ANALYZE_RATE_LIMIT: Final[int] = max(1, int(os.getenv("ANALYZE_RATE_LIMIT", "30")))
+ANALYZE_RATE_WINDOW_SECONDS: Final[int] = max(
+    60, int(os.getenv("ANALYZE_RATE_WINDOW_SECONDS", "3600"))
+)
 
 ALLOWED_EXTENSIONS: Final[set[str]] = {".pdf", ".txt", ".md", ".csv", ".docx"}
 ANSWER_EXTENSIONS: Final[set[str]] = {".txt", ".md", ".csv", ".json"}
@@ -176,6 +191,49 @@ Base.metadata.create_all(engine)
 
 _secret_digest = hashlib.sha256(EFFECTIVE_APP_SECRET.encode("utf-8")).digest()
 fernet = Fernet(base64.urlsafe_b64encode(_secret_digest))
+
+_rate_limit_lock = Lock()
+_rate_limit_buckets: dict[str, list[float]] = {}
+
+
+def _prune_rate_bucket(key: str, window_seconds: int, now: float) -> list[float]:
+    cutoff = now - window_seconds
+    bucket = [stamp for stamp in _rate_limit_buckets.get(key, []) if stamp > cutoff]
+    if bucket:
+        _rate_limit_buckets[key] = bucket
+    else:
+        _rate_limit_buckets.pop(key, None)
+    return bucket
+
+
+def rate_limit_retry_after(key: str, limit: int, window_seconds: int) -> int:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _prune_rate_bucket(key, window_seconds, now)
+        if len(bucket) < limit:
+            return 0
+        return max(1, int(window_seconds - (now - bucket[0]) + 0.999))
+
+
+def record_rate_limit_event(key: str, window_seconds: int) -> None:
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _prune_rate_bucket(key, window_seconds, now)
+        bucket.append(now)
+        _rate_limit_buckets[key] = bucket
+
+
+def consume_rate_limit(key: str, limit: int, window_seconds: int) -> int:
+    retry_after = rate_limit_retry_after(key, limit, window_seconds)
+    if retry_after:
+        return retry_after
+    record_rate_limit_event(key, window_seconds)
+    return 0
+
+
+def clear_rate_limit(key: str) -> None:
+    with _rate_limit_lock:
+        _rate_limit_buckets.pop(key, None)
 
 
 @contextmanager
@@ -665,6 +723,7 @@ def extract_pdf_analysis(data: bytes) -> dict:
     seen: set[tuple[int, str, str]] = set()
     ocr_pages: list[int] = []
     ocr_error: Optional[str] = None
+    ocr_started = time.monotonic()
 
     for page_index, page in enumerate(doc):
         page_text = page.get_text("text") or ""
@@ -676,16 +735,24 @@ def extract_pdf_analysis(data: bytes) -> dict:
             and page_index < OCR_MAX_PAGES
             and _page_needs_ocr(page_text)
         ):
-            try:
-                ocr_lines = ocr_page_lines(page)
-                if ocr_lines:
-                    ocr_pages.append(page_index + 1)
-                    page_text_for_analysis = "\n".join(
-                        line["text"] for line in ocr_lines
-                    )
-            except Exception as exc:
+            elapsed = time.monotonic() - ocr_started
+            if elapsed >= OCR_TOTAL_TIMEOUT_SECONDS:
                 if ocr_error is None:
-                    ocr_error = f"{type(exc).__name__}: {exc}"[:240]
+                    ocr_error = (
+                        f"OCR document time budget of "
+                        f"{OCR_TOTAL_TIMEOUT_SECONDS} seconds was reached."
+                    )
+            else:
+                try:
+                    ocr_lines = ocr_page_lines(page)
+                    if ocr_lines:
+                        ocr_pages.append(page_index + 1)
+                        page_text_for_analysis = "\n".join(
+                            line["text"] for line in ocr_lines
+                        )
+                except Exception as exc:
+                    if ocr_error is None:
+                        ocr_error = f"{type(exc).__name__}: {exc}"[:240]
 
         full_text_parts.append(
             f"--- Page {page_index + 1} ---\n{page_text_for_analysis}".strip()
@@ -980,6 +1047,19 @@ def payment_configured() -> bool:
     )
 
 
+def readiness_issues() -> list[str]:
+    issues: list[str] = []
+    if ENVIRONMENT == "production" and not SECURE_CONFIGURATION:
+        issues.append("secure_configuration")
+    if not DURABLE_STORAGE:
+        issues.append("durable_storage")
+    if OCR_ENABLED and not ocr_available():
+        issues.append("ocr_runtime")
+    if STRIPE_REQUIRE_PAYMENT and not payment_configured():
+        issues.append("payments")
+    return issues
+
+
 def checkout_url_for_user(user: User) -> str:
     if not payment_configured():
         raise HTTPException(status_code=503, detail="Stripe checkout is not fully configured.")
@@ -1095,13 +1175,52 @@ def payment_required_page(request: Request, user: User) -> HTMLResponse:
     return HTMLResponse(page_shell("Payment Required", body, request), status_code=402)
 
 
-app = FastAPI(title=APP_NAME, version="2.1.0")
+app = FastAPI(
+    title=APP_NAME,
+    version="2.1.0",
+    docs_url=None if ENVIRONMENT == "production" else "/docs",
+    redoc_url=None if ENVIRONMENT == "production" else "/redoc",
+    openapi_url=None if ENVIRONMENT == "production" else "/openapi.json",
+)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    issues = readiness_issues()
+    public_when_unready = {"/health", "/config", "/privacy", "/terms"}
+    path = request.url.path
+    production_blocked = (
+        ENVIRONMENT == "production"
+        and bool(issues)
+        and path not in public_when_unready
+        and not path.startswith("/static/")
+    )
+
+    if production_blocked:
+        if path.startswith("/api/") or path == "/stripe/webhook":
+            response = JSONResponse(
+                {"ok": False, "error": "service_not_ready"},
+                status_code=503,
+            )
+        else:
+            response = HTMLResponse(
+                f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(APP_NAME)} — Setup in progress</title>
+<link rel="stylesheet" href="/static/styles.css"></head>
+<body><main class="wrap"><section class="card narrow">
+<p class="eyebrow">Secure setup in progress</p>
+<h1>Uploads are temporarily disabled</h1>
+<p>{html.escape(APP_NAME)} is not accepting customer documents until secure persistent storage and required production configuration are verified.</p>
+<p class="muted">No document was accepted or stored by this request.</p>
+</section></main></body></html>""",
+                status_code=503,
+            )
+    else:
+        response = await call_next(request)
+
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -1121,16 +1240,9 @@ def health() -> JSONResponse:
     except Exception:
         database_ok = False
     status = 200 if database_ok else 503
+    issues = readiness_issues()
     secure_ready = SECURE_CONFIGURATION if ENVIRONMENT == "production" else True
-    payments_ready = payment_configured() if STRIPE_REQUIRE_PAYMENT else True
-    ocr_ready = (not OCR_ENABLED) or ocr_available()
-    launch_ready = bool(
-        database_ok
-        and secure_ready
-        and DURABLE_STORAGE
-        and payments_ready
-        and ocr_ready
-    )
+    launch_ready = bool(database_ok and not issues)
     return JSONResponse(
         {
             "ok": database_ok,
@@ -1144,6 +1256,7 @@ def health() -> JSONResponse:
             "ocr_enabled": OCR_ENABLED,
             "ocr_engine": OCR_ENGINE,
             "ocr_available": ocr_available(),
+            "readiness_issues": issues,
             "launch_ready": launch_ready,
         },
         status_code=status,
@@ -1171,6 +1284,9 @@ def config() -> JSONResponse:
             "ocr_max_pages": OCR_MAX_PAGES,
             "ocr_language": OCR_LANGUAGE,
             "ocr_psm": OCR_PSM,
+            "ocr_timeout_seconds": OCR_TIMEOUT_SECONDS,
+            "ocr_total_timeout_seconds": OCR_TOTAL_TIMEOUT_SECONDS,
+            "readiness_issues": readiness_issues(),
         }
     )
 
@@ -1451,11 +1567,27 @@ def login_page(request: Request) -> HTMLResponse:
 @app.post("/login")
 def login(email: str = Form(...), password: str = Form(...)) -> Response:
     email_clean = email.strip().lower()
+    login_key = "login:" + hashlib.sha256(email_clean.encode("utf-8")).hexdigest()
+    retry_after = rate_limit_retry_after(
+        login_key, LOGIN_RATE_LIMIT, LOGIN_RATE_WINDOW_SECONDS
+    )
+    if retry_after:
+        return HTMLResponse(
+            page_shell(
+                "Login",
+                '<section class="card narrow"><h1>Too many login attempts</h1><p>Try again after the cooldown period.</p></section>',
+            ),
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     with db_session() as session:
         user = session.scalar(select(User).where(User.email == email_clean))
         valid = bool(user and verify_password(password, user.password_hash))
         user_id = user.id if valid and user else None
+
     if not valid or user_id is None:
+        record_rate_limit_event(login_key, LOGIN_RATE_WINDOW_SECONDS)
         return HTMLResponse(
             page_shell(
                 "Login",
@@ -1463,6 +1595,8 @@ def login(email: str = Form(...), password: str = Form(...)) -> Response:
             ),
             status_code=401,
         )
+
+    clear_rate_limit(login_key)
     token = create_session(user_id)
     response = RedirectResponse(url="/", status_code=303)
     set_session_cookie(response, token)
@@ -1493,6 +1627,15 @@ def upload_document(
     if user is None:
         return login_required_page(request)
     validate_csrf(request, csrf)
+    retry_after = consume_rate_limit(
+        f"analyze:{user.id}", ANALYZE_RATE_LIMIT, ANALYZE_RATE_WINDOW_SECONDS
+    )
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Document analysis rate limit reached.",
+            headers={"Retry-After": str(retry_after)},
+        )
     filename, suffix, data = read_upload_bytes(file)
     analysis = analyze_document(filename, suffix, data)
     document_id = uuid.uuid4().hex
@@ -1772,6 +1915,15 @@ def api_upload_document(request: Request, file: UploadFile = File(...)) -> JSONR
     user = current_user(request)
     if user is None:
         return JSONResponse({"ok": False, "error": "login_required"}, status_code=401)
+    retry_after = consume_rate_limit(
+        f"analyze:{user.id}", ANALYZE_RATE_LIMIT, ANALYZE_RATE_WINDOW_SECONDS
+    )
+    if retry_after:
+        return JSONResponse(
+            {"ok": False, "error": "rate_limited", "retry_after": retry_after},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
     filename, suffix, data = read_upload_bytes(file)
     analysis = analyze_document(filename, suffix, data)
     document_id = uuid.uuid4().hex
