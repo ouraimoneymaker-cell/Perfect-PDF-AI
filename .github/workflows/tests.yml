@@ -35,7 +35,7 @@ jobs:
         run: python -m py_compile app.py
 
       - name: Verify OCR runtime
-        run: python -c "import onnxruntime, rapidocr; print(onnxruntime.__version__)"
+        run: python -c "import MNN, rapidocr; print('MNN_OK')"
 
       - name: Run tests
         run: python -m pytest -q
