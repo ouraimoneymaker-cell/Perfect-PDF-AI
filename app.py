@@ -537,7 +537,7 @@ def get_ocr_engine():
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
-        from rapidocr import RapidOCR
+        from rapidocr import ModelType, RapidOCR
 
         _ocr_engine = RapidOCR(
             params={
@@ -546,6 +546,8 @@ def get_ocr_engine():
                 "EngineConfig.onnxruntime.intra_op_num_threads": 1,
                 "EngineConfig.onnxruntime.inter_op_num_threads": 1,
                 "EngineConfig.onnxruntime.enable_cpu_mem_arena": False,
+                "Det.model_type": ModelType.TINY,
+                "Rec.model_type": ModelType.TINY,
                 "Det.thresh": 0.20,
                 "Det.box_thresh": 0.30,
                 "Rec.rec_batch_num": 1,
