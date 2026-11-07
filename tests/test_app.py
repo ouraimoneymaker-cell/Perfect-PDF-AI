@@ -16,6 +16,8 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB}"
 os.environ["STRIPE_REQUIRE_PAYMENT"] = "false"
 os.environ["STRIPE_PAYMENT_LINK"] = "https://buy.stripe.com/test_perfect_pdf_ai"
 os.environ["STRIPE_WEBHOOK_SECRET"] = "whsec_perfect_pdf_ai_test"
+os.environ["STRIPE_PAYMENT_LINK_ID"] = "plink_test_perfect_pdf_ai"
+os.environ["OCR_ENABLED"] = "true"
 os.environ["FREE_COMPLETIONS"] = "1"
 os.environ["PAYMENT_CREDITS"] = "1"
 
@@ -81,6 +83,22 @@ def sample_pdf(label: str = "Full Name:") -> bytes:
     return data
 
 
+def scanned_pdf() -> bytes:
+    source = fitz.open()
+    source_page = source.new_page(width=612, height=792)
+    source_page.insert_text((72, 130), "Full Name: __________________________", fontsize=11)
+    source_page.insert_text((72, 165), "Email: ______________________________", fontsize=11)
+    pix = source_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+    source.close()
+
+    scanned = fitz.open()
+    page = scanned.new_page(width=612, height=792)
+    page.insert_image(page.rect, stream=pix.tobytes("png"))
+    data = scanned.tobytes()
+    scanned.close()
+    return data
+
+
 def upload_pdf(client: TestClient, filename: str = "application.pdf", label: str = "Full Name:") -> str:
     response = client.post(
         "/upload",
@@ -106,11 +124,16 @@ def test_health_and_config(client):
     payload = health.json()
     assert payload["ok"] is True
     assert payload["service"] == "perfect-pdf-ai"
-    assert payload["version"] == "2.0.0"
+    assert payload["version"] == "2.1.0"
+    assert payload["storage_backend"] == "sqlite"
+    assert payload["durable_storage"] is False
+    assert payload["ocr_enabled"] is True
+    assert payload["launch_ready"] is False
 
     config = client.get("/config")
     assert config.status_code == 200
     assert ".pdf" in config.json()["allowed_extensions"]
+    assert config.json()["ocr_enabled"] is True
 
 
 def test_registration_login_and_secure_session_hash(client):
@@ -149,6 +172,35 @@ def test_smart_mapping_matches_semantic_labels():
     assert mapped["f1"]["value"] == "Jane Smith"
     assert mapped["f2"]["value"] == "123 Main Street"
     assert mapped["f3"]["value"] == "617-555-0100"
+
+
+def test_ocr_runtime_dependencies_import():
+    import onnxruntime
+    import rapidocr
+
+    assert onnxruntime.__version__
+    assert rapidocr is not None
+
+
+def test_scanned_pdf_uses_ocr_coordinates(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "ocr_page_lines",
+        lambda page: [
+            {"text": "Full Name:", "score": 0.99, "rect": [72.0, 130.0, 145.0, 143.0]},
+            {"text": "Email:", "score": 0.98, "rect": [72.0, 165.0, 120.0, 178.0]},
+        ],
+    )
+
+    analysis = app_module.extract_pdf_analysis(scanned_pdf())
+
+    assert analysis["ocr_used"] is True
+    assert analysis["ocr_pages"] == [1]
+    assert analysis["ocr_error"] is None
+    assert [field["kind"] for field in analysis["fields"]] == ["ocr_text", "ocr_text"]
+    assert analysis["fields"][0]["label"] == "Full Name:"
+    assert analysis["fields"][0]["rect"] == [72.0, 130.0, 145.0, 143.0]
+    assert "Full Name:" in analysis["text"]
 
 
 def test_pdf_upload_detects_fields_and_generates_completed_pdf(client):
@@ -343,6 +395,8 @@ def test_stripe_webhook_grants_credit_idempotently(client):
                 "id": "cs_test_perfect_pdf_ai_1",
                 "object": "checkout.session",
                 "client_reference_id": str(user_id),
+                "payment_link": os.environ["STRIPE_PAYMENT_LINK_ID"],
+                "payment_status": "paid",
                 "amount_total": 999,
                 "currency": "usd",
             }
@@ -375,6 +429,52 @@ def test_stripe_webhook_grants_credit_idempotently(client):
     with db_session() as session:
         user = session.get(User, user_id)
         assert user.credits == starting_credits + PAYMENT_CREDITS
+
+
+def test_stripe_webhook_rejects_wrong_payment_link(client):
+    register(client)
+    with db_session() as session:
+        user = session.scalar(select(User).where(User.email == "user@example.com"))
+        user_id = user.id
+        starting_credits = user.credits
+
+    event = {
+        "id": "evt_test_wrong_link",
+        "object": "event",
+        "type": "checkout.session.completed",
+        "data": {
+            "object": {
+                "id": "cs_test_wrong_link",
+                "object": "checkout.session",
+                "client_reference_id": str(user_id),
+                "payment_link": "plink_unrelated_product",
+                "payment_status": "paid",
+                "amount_total": 999,
+                "currency": "usd",
+            }
+        },
+    }
+    payload = json.dumps(event, separators=(",", ":")).encode()
+    timestamp = int(time.time())
+    signature = hmac.new(
+        os.environ["STRIPE_WEBHOOK_SECRET"].encode(),
+        f"{timestamp}.".encode() + payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+    response = client.post(
+        "/stripe/webhook",
+        content=payload,
+        headers={
+            "stripe-signature": f"t={timestamp},v1={signature}",
+            "content-type": "application/json",
+        },
+    )
+    assert response.status_code == 200
+
+    with db_session() as session:
+        user = session.get(User, user_id)
+        assert user.credits == starting_credits
 
 
 def test_api_requires_login_and_returns_analysis(client):
