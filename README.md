@@ -12,7 +12,7 @@ Perfect PDF AI is a FastAPI web app that turns uploaded forms into completed PDF
 6. The completed PDF is encrypted before database storage and remains available in the user's history.
 7. Optional Stripe Payment Link + webhook integration grants completion credits after verified checkout completion events.
 
-The core form-mapping engine runs locally in the application and does not require a paid AI API.
+The core form-mapping engine runs locally in the application and does not require a paid AI API. Image-only scans are OCR'd with the open-source Tesseract engine bundled in the production Docker image.
 
 ## Security model
 
@@ -38,13 +38,19 @@ The app uses SQLAlchemy.
 
 ## Local run
 
+The production-equivalent path is Docker because OCR requires the Tesseract system package:
+
 \`\`\`bash
-pip install -r requirements.txt
-export APP_SECRET_KEY="replace-with-a-long-random-secret"
-uvicorn app:app --host 0.0.0.0 --port 8000
+docker build -t perfect-pdf-ai .
+docker run --rm -p 8000:8000 \
+  -e PORT=8000 \
+  -e APP_SECRET_KEY="replace-with-a-long-random-secret" \
+  perfect-pdf-ai
 \`\`\`
 
 Open http://localhost:8000.
+
+For a non-Docker developer environment, install Tesseract plus the Python requirements before starting Uvicorn.
 
 ## Tests
 
@@ -52,14 +58,15 @@ Open http://localhost:8000.
 pytest -q
 \`\`\`
 
-GitHub Actions also compiles app.py before running the suite.
+GitHub Actions installs Tesseract, compiles app.py, runs the full suite including a real image-only OCR test, audits Python dependencies, builds the production Docker image, and reruns the tests inside that image.
 
 ## Render
 
-render.yaml defines the free Python web service and requires `DATABASE_URL` to be supplied from a durable PostgreSQL provider:
+render.yaml defines a free Docker web service. The image installs Tesseract explicitly, making the OCR runtime reproducible. `DATABASE_URL` must still be supplied from a durable PostgreSQL provider:
 
 \`\`\`yaml
-startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+runtime: docker
+dockerfilePath: ./Dockerfile
 healthCheckPath: /health
 \`\`\`
 
@@ -70,6 +77,9 @@ ENVIRONMENT=production
 COOKIE_SECURE=true
 APP_SECRET_KEY=<stable secret>
 DATABASE_URL=<durable PostgreSQL connection string>
+OCR_ENABLED=true
+OCR_LANGUAGE=eng
+OCR_PSM=11
 \`\`\`
 
 ## Stripe monetization
@@ -130,4 +140,4 @@ POST /stripe/webhook
 
 ## Current implementation boundary
 
-The built-in intelligence is a local semantic/fuzzy mapping engine plus RapidOCR for image-only scanned pages. It does not call an external LLM and therefore has no per-document AI API cost. Handwriting and unusually complex layouts can still require manual correction, which is why detected answers are always presented for confirmation before generation.
+The built-in intelligence is a local semantic/fuzzy mapping engine plus Tesseract OCR for image-only scanned pages. It does not call an external LLM and therefore has no per-document AI API cost. Handwriting and unusually complex layouts can still require manual correction, which is why detected answers are always presented for confirmation before generation.
