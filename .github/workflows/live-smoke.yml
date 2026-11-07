@@ -1,0 +1,30 @@
+name: Live End-to-End Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Perfect PDF AI URL to verify"
+        required: true
+        default: "https://perfect-pdf-ai-tesseract-staging.onrender.com"
+        type: string
+
+jobs:
+  live-smoke:
+    runs-on: ubuntu-latest
+    env:
+      SMOKE_BASE_URL: ${{ inputs.base_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.16"
+
+      - name: Install smoke dependencies
+        run: pip install httpx==0.28.1 PyMuPDF==1.25.1
+
+      - name: Run live end-to-end smoke
+        run: python scripts/live_smoke.py
