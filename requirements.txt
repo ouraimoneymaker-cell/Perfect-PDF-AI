@@ -1,7 +1,7 @@
 fastapi==0.162.1
 uvicorn[standard]==0.34.0
 python-multipart==0.0.33
-PyMuPDF==1.25.1
+PyMuPDF==2.1
 pytest==9.2.0
 httpx==0.28.1
 SQLAlchemy==2.0.36
