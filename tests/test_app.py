@@ -477,6 +477,67 @@ def test_stripe_webhook_rejects_wrong_payment_link(client):
         assert user.credits == starting_credits
 
 
+
+def test_privacy_terms_and_account_pages(client):
+    assert client.get("/privacy").status_code == 200
+    assert client.get("/terms").status_code == 200
+
+    register(client)
+    account = client.get("/account")
+    assert account.status_code == 200
+    assert "Delete account" in account.text
+    assert "user@example.com" in account.text
+
+
+def test_document_delete_is_owner_scoped_and_permanent(client):
+    register(client)
+    document_id = upload_pdf(client, filename="delete-me.pdf")
+
+    response = client.post(
+        f"/documents/{document_id}/delete",
+        data={"csrf": csrf(client)},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+    missing = client.get(f"/documents/{document_id}")
+    assert missing.status_code == 404
+
+
+def test_account_delete_requires_password_and_removes_application_data(client):
+    register(client)
+    document_id = upload_pdf(client, filename="account-data.pdf")
+
+    with db_session() as session:
+        user = session.scalar(select(User).where(User.email == "user@example.com"))
+        assert user is not None
+        user_id = user.id
+
+    wrong = client.post(
+        "/account/delete",
+        data={"csrf": csrf(client), "password": "not-the-password"},
+        follow_redirects=False,
+    )
+    assert wrong.status_code == 403
+
+    deleted = client.post(
+        "/account/delete",
+        data={"csrf": csrf(client), "password": "password123"},
+        follow_redirects=False,
+    )
+    assert deleted.status_code == 303
+    assert deleted.headers["location"] == "/"
+
+    with db_session() as session:
+        assert session.get(User, user_id) is None
+        document = session.get(app_module.DocumentRecord, document_id)
+        assert document is None
+
+    assert client.get("/account").status_code == 401
+
+
+
 def test_api_requires_login_and_returns_analysis(client):
     unauth = client.post(
         "/api/upload",
