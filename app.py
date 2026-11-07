@@ -224,11 +224,14 @@ def record_rate_limit_event(key: str, window_seconds: int) -> None:
 
 
 def consume_rate_limit(key: str, limit: int, window_seconds: int) -> int:
-    retry_after = rate_limit_retry_after(key, limit, window_seconds)
-    if retry_after:
-        return retry_after
-    record_rate_limit_event(key, window_seconds)
-    return 0
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _prune_rate_bucket(key, window_seconds, now)
+        if len(bucket) >= limit:
+            return max(1, int(window_seconds - (now - bucket[0]) + 0.999))
+        bucket.append(now)
+        _rate_limit_buckets[key] = bucket
+        return 0
 
 
 def clear_rate_limit(key: str) -> None:
@@ -1701,6 +1704,14 @@ def document_detail(request: Request, document_id: str) -> HTMLResponse:
         fresh_user = session.get(User, user.id)
         credits = fresh_user.credits if fresh_user else 0
 
+    ocr_notice = ""
+    if analysis.get("ocr_error"):
+        ocr_notice = (
+            '<div class="notice warning"><strong>OCR review required.</strong> '
+            + html.escape(str(analysis["ocr_error"]))
+            + " Check the detected fields before generating the PDF.</div>"
+        )
+
     pay_notice = ""
     if STRIPE_REQUIRE_PAYMENT and credits <= 0:
         if payment_configured():
@@ -1736,6 +1747,7 @@ def document_detail(request: Request, document_id: str) -> HTMLResponse:
     <section class="card">
       <h2>Confirm the answers</h2>
       <p>Saved answers are filled automatically when the labels match. Correct anything that needs changing; the updated values are saved for your next form.</p>
+      {ocr_notice}
       {pay_notice}
       <form method="post" action="/documents/{record.id}/complete" class="upload-form">
         <input type="hidden" name="csrf" value="{csrf}">
