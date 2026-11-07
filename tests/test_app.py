@@ -203,6 +203,18 @@ def test_scanned_pdf_uses_ocr_coordinates(monkeypatch):
     assert "Full Name:" in analysis["text"]
 
 
+
+def test_ocr_engine_processes_scanned_page():
+    pdf = fitz.open(stream=scanned_pdf(), filetype="pdf")
+    page = pdf[0]
+    lines = app_module.ocr_page_lines(page)
+    pdf.close()
+
+    assert len(lines) > 0
+    recognized = " ".join(line["text"] for line in lines).lower()
+    assert ("name" in recognized) or ("email" in recognized)
+
+
 def test_pdf_upload_detects_fields_and_generates_completed_pdf(client):
     register(client)
     document_id = upload_pdf(client)
