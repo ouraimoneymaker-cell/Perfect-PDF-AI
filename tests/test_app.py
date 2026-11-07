@@ -175,10 +175,10 @@ def test_smart_mapping_matches_semantic_labels():
 
 
 def test_ocr_runtime_dependencies_import():
-    import onnxruntime
+    import MNN
     import rapidocr
 
-    assert onnxruntime.__version__
+    assert MNN is not None
     assert rapidocr is not None
 
 
