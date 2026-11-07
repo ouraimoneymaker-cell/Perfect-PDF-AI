@@ -7,6 +7,7 @@ completed-PDF generation, account history, and Stripe-ready monetization.
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
 import html
@@ -15,6 +16,9 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -77,6 +81,10 @@ OCR_MIN_TEXT_CHARS: Final[int] = max(0, int(os.getenv("OCR_MIN_TEXT_CHARS", "40"
 OCR_MIN_CONFIDENCE: Final[float] = max(
     0.0, min(1.0, float(os.getenv("OCR_MIN_CONFIDENCE", "0.55")))
 )
+OCR_LANGUAGE: Final[str] = os.getenv("OCR_LANGUAGE", "eng").strip() or "eng"
+OCR_PSM: Final[int] = max(3, min(13, int(os.getenv("OCR_PSM", "11"))))
+OCR_TIMEOUT_SECONDS: Final[int] = max(5, int(os.getenv("OCR_TIMEOUT_SECONDS", "45")))
+OCR_ENGINE: Final[str] = "tesseract"
 
 ALLOWED_EXTENSIONS: Final[set[str]] = {".pdf", ".txt", ".md", ".csv", ".docx"}
 ANSWER_EXTENSIONS: Final[set[str]] = {".txt", ".md", ".csv", ".json"}
@@ -524,70 +532,117 @@ def _page_needs_ocr(text: str) -> bool:
     return len(compact) < OCR_MIN_TEXT_CHARS
 
 
-_ocr_engine = None
+def ocr_available() -> bool:
+    return bool(shutil.which("tesseract"))
 
 
-def get_ocr_engine():
-    global _ocr_engine
-    if _ocr_engine is None:
-        # Render Free is memory constrained. Keep ONNX Runtime from sizing
-        # thread pools from the host machine instead of this container's quota.
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
-        os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+def _parse_tesseract_tsv(tsv_text: str, scale: float) -> list[dict]:
+    groups: dict[tuple[str, str, str, str], dict] = {}
+    reader = csv.DictReader(io.StringIO(tsv_text), delimiter="\t")
+    threshold = OCR_MIN_CONFIDENCE * 100.0
 
-        from rapidocr import ModelType, RapidOCR
+    for row in reader:
+        if row.get("level") != "5":
+            continue
+        text = " ".join((row.get("text") or "").split()).strip()
+        if not text:
+            continue
+        try:
+            confidence = float(row.get("conf") or -1)
+            left = float(row.get("left") or 0)
+            top = float(row.get("top") or 0)
+            width = float(row.get("width") or 0)
+            height = float(row.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if confidence < threshold or width <= 0 or height <= 0:
+            continue
 
-        _ocr_engine = RapidOCR(
-            params={
-                "Global.text_score": 0.35,
-                "Global.use_cls": False,
-                "EngineConfig.onnxruntime.intra_op_num_threads": 1,
-                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-                "EngineConfig.onnxruntime.enable_cpu_mem_arena": False,
-                "Det.model_type": ModelType.TINY,
-                "Rec.model_type": ModelType.TINY,
-                "Det.thresh": 0.20,
-                "Det.box_thresh": 0.30,
-                "Rec.rec_batch_num": 1,
-            }
+        key = (
+            row.get("page_num") or "0",
+            row.get("block_num") or "0",
+            row.get("par_num") or "0",
+            row.get("line_num") or "0",
         )
-    return _ocr_engine
-
-
-def _ocr_page_lines_at_dpi(page, dpi: int) -> list[dict]:
-    scale = dpi / 72.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-    result = get_ocr_engine()(pix.tobytes("png"))
-    boxes = getattr(result, "boxes", None)
-    texts = getattr(result, "txts", None) or ()
-    scores = getattr(result, "scores", None) or ()
-    if boxes is None:
-        return []
+        group = groups.setdefault(
+            key,
+            {
+                "words": [],
+                "scores": [],
+                "x0": left,
+                "y0": top,
+                "x1": left + width,
+                "y1": top + height,
+            },
+        )
+        group["words"].append(text)
+        group["scores"].append(confidence)
+        group["x0"] = min(group["x0"], left)
+        group["y0"] = min(group["y0"], top)
+        group["x1"] = max(group["x1"], left + width)
+        group["y1"] = max(group["y1"], top + height)
 
     lines: list[dict] = []
-    for box, text, score in zip(boxes, texts, scores):
-        text_clean = " ".join(str(text).split()).strip()
-        score_value = float(score or 0.0)
-        if not text_clean or score_value < OCR_MIN_CONFIDENCE:
+    for group in groups.values():
+        line_text = " ".join(group["words"]).strip()
+        if not line_text:
             continue
-        points = list(box)
-        xs = [float(point[0]) for point in points]
-        ys = [float(point[1]) for point in points]
+        score = sum(group["scores"]) / len(group["scores"]) / 100.0
         lines.append(
             {
-                "text": text_clean,
-                "score": score_value,
+                "text": line_text,
+                "score": score,
                 "rect": [
-                    min(xs) / scale,
-                    min(ys) / scale,
-                    max(xs) / scale,
-                    max(ys) / scale,
+                    group["x0"] / scale,
+                    group["y0"] / scale,
+                    group["x1"] / scale,
+                    group["y1"] / scale,
                 ],
             }
         )
+
+    lines.sort(key=lambda item: (item["rect"][1], item["rect"][0]))
     return lines
+
+
+def _ocr_page_lines_at_dpi(page, dpi: int) -> list[dict]:
+    if not ocr_available():
+        raise RuntimeError("Tesseract OCR executable is not installed.")
+
+    scale = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    image_bytes = pix.tobytes("png")
+
+    with tempfile.NamedTemporaryFile(suffix=".png") as image_file:
+        image_file.write(image_bytes)
+        image_file.flush()
+        try:
+            completed = subprocess.run(
+                [
+                    "tesseract",
+                    image_file.name,
+                    "stdout",
+                    "-l",
+                    OCR_LANGUAGE,
+                    "--psm",
+                    str(OCR_PSM),
+                    "tsv",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=OCR_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Tesseract OCR timed out after {OCR_TIMEOUT_SECONDS} seconds."
+            ) from exc
+
+    if completed.returncode != 0:
+        error = " ".join((completed.stderr or "").split())[:240]
+        raise RuntimeError(f"Tesseract OCR failed: {error or 'unknown error'}")
+
+    return _parse_tesseract_tsv(completed.stdout, scale)
 
 
 def ocr_page_lines(page) -> list[dict]:
@@ -1068,7 +1123,14 @@ def health() -> JSONResponse:
     status = 200 if database_ok else 503
     secure_ready = SECURE_CONFIGURATION if ENVIRONMENT == "production" else True
     payments_ready = payment_configured() if STRIPE_REQUIRE_PAYMENT else True
-    launch_ready = bool(database_ok and secure_ready and DURABLE_STORAGE and payments_ready)
+    ocr_ready = (not OCR_ENABLED) or ocr_available()
+    launch_ready = bool(
+        database_ok
+        and secure_ready
+        and DURABLE_STORAGE
+        and payments_ready
+        and ocr_ready
+    )
     return JSONResponse(
         {
             "ok": database_ok,
@@ -1080,6 +1142,8 @@ def health() -> JSONResponse:
             "secure_configuration": secure_ready,
             "payments_configured": payment_configured(),
             "ocr_enabled": OCR_ENABLED,
+            "ocr_engine": OCR_ENGINE,
+            "ocr_available": ocr_available(),
             "launch_ready": launch_ready,
         },
         status_code=status,
@@ -1101,8 +1165,12 @@ def config() -> JSONResponse:
             "storage_backend": STORAGE_BACKEND,
             "durable_storage": DURABLE_STORAGE,
             "ocr_enabled": OCR_ENABLED,
+            "ocr_engine": OCR_ENGINE,
+            "ocr_available": ocr_available(),
             "ocr_dpi": OCR_DPI,
             "ocr_max_pages": OCR_MAX_PAGES,
+            "ocr_language": OCR_LANGUAGE,
+            "ocr_psm": OCR_PSM,
         }
     )
 
