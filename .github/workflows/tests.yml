@@ -37,7 +37,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Compile application
-        run: python -m py_compile app.py
+        run: python -m py_compile app.py scripts/live_smoke.py
 
       - name: Verify OCR runtime
         run: tesseract --version
