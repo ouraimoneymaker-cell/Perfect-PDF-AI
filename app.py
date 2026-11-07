@@ -530,22 +530,21 @@ _ocr_engine = None
 def get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
-        # Render Free is memory constrained. Keep ONNX Runtime from sizing
-        # thread pools from the host machine instead of this container's quota.
+        # Render Free is memory constrained. Keep native OCR work single-threaded
+        # and use MNN instead of the ONNX Runtime backend that crashed the worker.
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
-        from rapidocr import ModelType, RapidOCR
+        from rapidocr import EngineType, ModelType, RapidOCR
 
         _ocr_engine = RapidOCR(
             params={
                 "Global.text_score": 0.35,
                 "Global.use_cls": False,
-                "EngineConfig.onnxruntime.intra_op_num_threads": 1,
-                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-                "EngineConfig.onnxruntime.enable_cpu_mem_arena": False,
+                "Det.engine_type": EngineType.MNN,
+                "Rec.engine_type": EngineType.MNN,
                 "Det.model_type": ModelType.TINY,
                 "Rec.model_type": ModelType.TINY,
                 "Det.thresh": 0.20,
